@@ -709,6 +709,58 @@ device_result_t device_host_send_app_data(device_host_t *host, const char *utf8_
     return DEVICE_OK;
 }
 
+device_result_t device_host_send_serial_bytes(device_host_t *host, const uint8_t *bytes,
+                                              size_t length, device_error_t *error)
+{
+    if (error != NULL)
+        memset(error, 0, sizeof(*error));
+    if (host == NULL) {
+        err_set(error, DEVICE_ERR_INVALID_ARGUMENT, 0, "send_serial_bytes", "host 为空");
+        return DEVICE_ERR_INVALID_ARGUMENT;
+    }
+    if (bytes == NULL || length == 0 || length > PROTO_V2_SERIAL_CHUNK_MAX) {
+        err_set(error, DEVICE_ERR_INVALID_ARGUMENT, 0, "send_serial_bytes",
+                "长度必须在 1~16384 字节");
+        return DEVICE_ERR_INVALID_ARGUMENT;
+    }
+
+    host->plat->mutex_lock(host->state_mutex);
+    device_host_state_t st = host->state;
+    host->plat->mutex_unlock(host->state_mutex);
+    if (st != DEVICE_HOST_RUNNING) {
+        err_set(error, DEVICE_ERR_INVALID_STATE, 0, "send_serial_bytes", "设备未在运行");
+        host_set_last_error(host, "设备未在运行，无法发送串口字节");
+        return DEVICE_ERR_INVALID_STATE;
+    }
+    host->plat->mutex_lock(host->snapshot_mutex);
+    int session = host->snapshot.device_state == (int)DEV_STATE_SESSION;
+    host->plat->mutex_unlock(host->snapshot_mutex);
+    if (!session) {
+        err_set(error, DEVICE_ERR_INVALID_STATE, 0, "send_serial_bytes", "当前非会话状态");
+        host_set_last_error(host, "当前非会话状态，无法发送串口字节");
+        return DEVICE_ERR_INVALID_STATE;
+    }
+
+    uint8_t *copy = (uint8_t *)malloc(length);
+    if (copy == NULL) {
+        err_set(error, DEVICE_ERR_NO_MEMORY, 0, "send_serial_bytes", "分配失败");
+        return DEVICE_ERR_NO_MEMORY;
+    }
+    memcpy(copy, bytes, length);
+
+    device_cmd_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.kind = DEVICE_CMD_SERIAL_BYTES;
+    cmd.serial_data = copy;
+    cmd.serial_len = length;
+    if (device_cmd_queue_push(host->cmds, &cmd) == DEVICE_QUEUE_FULL) {
+        free(copy);
+        err_set(error, DEVICE_ERR_BUSY, 0, "send_serial_bytes", "命令队列已满");
+        return DEVICE_ERR_BUSY;
+    }
+    return DEVICE_OK;
+}
+
 device_result_t device_host_inject_fault(device_host_t *host, const char *action,
                                          const char *argument_json,
                                          device_error_t *error)

@@ -32,6 +32,10 @@ void device_config_defaults(device_config_t *cfg)
     cfg->use_real_wifi_sta = 0;
     snprintf(cfg->device_fw_version, sizeof(cfg->device_fw_version), "1.0.0");
     cfg->device_proto_ver = 1;
+    cfg->serial_rows = 36;
+    cfg->serial_cols = 44;
+    cfg->serial_data_points = cfg->serial_rows * cfg->serial_cols;
+    cfg->serial_frame_size = 4 + cfg->serial_data_points * 2;
     cfg->duration_s = 0;
     cfg->scenario_path[0] = '\0';
     cfg->config_tag[0] = '\0';
@@ -142,6 +146,10 @@ int device_config_load(device_config_t *cfg, const char *json_path,
     LOAD_INT(use_real_wifi_sta);
     LOAD_STR(device_fw_version);
     LOAD_INT(device_proto_ver);
+    LOAD_INT(serial_frame_size);
+    LOAD_INT(serial_rows);
+    LOAD_INT(serial_cols);
+    LOAD_INT(serial_data_points);
     LOAD_INT(duration_s);
     LOAD_STR(scenario_path);
     LOAD_STR(config_tag);

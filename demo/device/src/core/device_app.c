@@ -215,28 +215,139 @@ void device_set_state(device_app_t *app, device_state_t s)
 
 device_state_t device_app_get_state(const device_app_t *app) { return app->state; }
 
+/* 清空发送队列与 in-flight（断线/新连接时调用，丢弃未发送帧并计数）。 */
+void device_app_tx_clear(device_app_t *app)
+{
+    if (app == NULL)
+        return;
+    for (int i = 0; i < app->tx_count; i++) {
+        size_t idx = (size_t)((app->tx_head + i) % DEV_TX_QUEUE_CAP);
+        free(app->tx_queue[idx].data);
+        app->tx_queue[idx].data = NULL;
+        app->tx_queue[idx].len = 0;
+    }
+    app->tx_head = 0;
+    app->tx_count = 0;
+    free(app->tx_inflight_data);
+    app->tx_inflight_data = NULL;
+    app->tx_inflight_len = 0;
+    app->tx_inflight_off = 0;
+}
+
+/* 编码一帧并入队；序列号在本 session 内严格递增（新连接时由调用方归零）。 */
+static int device_app_enqueue_frame(device_app_t *app, uint8_t frame_type,
+                                    const uint8_t *payload, int payload_len)
+{
+    if (app == NULL)
+        return DEMO_ERR_INVAL;
+    if (app->tx_count >= DEV_TX_QUEUE_CAP)
+        return DEMO_ERR;
+    int total = PROTO_V2_HEAD_LEN + PROTO_V2_BODY_HEAD_LEN + payload_len;
+    uint8_t *frame = (uint8_t *)malloc((size_t)total);
+    if (frame == NULL)
+        return DEMO_ERR_NOMEM;
+    int n = frame_v2_wrap(frame_type, ++app->tx_sequence, payload, payload_len,
+                          frame, total);
+    if (n < 0) {
+        free(frame);
+        return n;
+    }
+    size_t idx = (size_t)((app->tx_head + app->tx_count) % DEV_TX_QUEUE_CAP);
+    app->tx_queue[idx].data = frame;
+    app->tx_queue[idx].len = n;
+    app->tx_count++;
+    return DEMO_OK;
+}
+
 int device_send_frame_raw(device_app_t *app, void *sock, const char *json)
 {
-    uint8_t frame[PROTO_MSG_MAX_LEN + PROTO_FRAME_HEAD_LEN];
-    int flen = frame_wrap((const uint8_t *)json, (int)strlen(json), frame, (int)sizeof(frame));
-    if (flen < 0)
-        return DEMO_ERR;
-    int rc = net_sock_send(app->net, sock, frame, flen);
-    if (rc >= 0) {
-        LOG_I(app->device_id, "TX %s", json);
-        return DEMO_OK;
-    }
-    return rc;
+    (void)sock;
+    if (json == NULL)
+        return DEMO_ERR_INVAL;
+    return device_app_enqueue_frame(app, PROTO_V2_TYPE_CONTROL_JSON,
+                                    (const uint8_t *)json, (int)strlen(json));
 }
 
 int device_send_frame(device_app_t *app, void *sock, cJSON *obj)
 {
+    (void)sock;
+    if (obj == NULL)
+        return DEMO_ERR_INVAL;
     char *s = cJSON_PrintUnformatted(obj);
     if (s == NULL)
         return DEMO_ERR_NOMEM;
-    int rc = device_send_frame_raw(app, sock, s);
+    int rc = device_send_frame_raw(app, NULL, s);
     free(s);
     return rc;
+}
+
+int device_app_enqueue_serial_bytes(device_app_t *app, const uint8_t *bytes, size_t len)
+{
+    if (app == NULL || bytes == NULL)
+        return DEMO_ERR_INVAL;
+    if (len == 0 || len > PROTO_V2_SERIAL_CHUNK_MAX)
+        return DEMO_ERR_INVAL;
+    if (app->state != DEV_STATE_SESSION || app->sess_sock == NULL)
+        return DEMO_ERR; /* 非会话态：调用方丢弃该 chunk */
+    return device_app_enqueue_frame(app, PROTO_V2_TYPE_SERIAL_BYTES, bytes, (int)len);
+}
+
+/* 冲刷发送队列：续传 in-flight，再按序发送队列帧。返回 0=连接已断。 */
+static int device_app_flush_tx(device_app_t *app)
+{
+    if (app == NULL || app->sess_sock == NULL)
+        return 1;
+
+    if (app->tx_inflight_data != NULL) {
+        int n = net_sock_send(app->net, app->sess_sock,
+                              app->tx_inflight_data + app->tx_inflight_off,
+                              app->tx_inflight_len - app->tx_inflight_off);
+        if (n == DEMO_ERR_AGAIN)
+            return 1; /* 保持 in-flight，下轮续传 */
+        if (n <= 0) {
+            free(app->tx_inflight_data);
+            app->tx_inflight_data = NULL;
+            app->tx_inflight_len = 0;
+            app->tx_inflight_off = 0;
+            session_disconnect(app);
+            return 0;
+        }
+        app->tx_inflight_off += n;
+        if (app->tx_inflight_off >= app->tx_inflight_len) {
+            free(app->tx_inflight_data);
+            app->tx_inflight_data = NULL;
+            app->tx_inflight_len = 0;
+            app->tx_inflight_off = 0;
+        } else {
+            return 1; /* 部分写，下轮续传 */
+        }
+    }
+
+    while (app->tx_count > 0) {
+        struct dev_tx_item it = app->tx_queue[app->tx_head];
+        app->tx_head = (app->tx_head + 1) % DEV_TX_QUEUE_CAP;
+        app->tx_count--;
+        int n = net_sock_send(app->net, app->sess_sock, it.data, it.len);
+        if (n == DEMO_ERR_AGAIN) {
+            app->tx_inflight_data = it.data;
+            app->tx_inflight_len = it.len;
+            app->tx_inflight_off = 0;
+            return 1;
+        }
+        if (n <= 0) {
+            free(it.data);
+            session_disconnect(app);
+            return 0;
+        }
+        if (n < it.len) {
+            app->tx_inflight_data = it.data;
+            app->tx_inflight_len = it.len;
+            app->tx_inflight_off = n;
+            return 1;
+        }
+        free(it.data);
+    }
+    return 1;
 }
 
 /* ---------------- 收包统一入口（仅业务会话） ---------------- */
@@ -667,6 +778,8 @@ int device_app_run_step(device_app_t *app)
         }
         app->next_tick_ms = net_time_ms(app->net) + 10;
     }
+    /* 冲刷发送队列（控制与数据统一，处理 partial write / EAGAIN）。 */
+    device_app_flush_tx(app);
     device_sleep_ms(10);
     return !dev_atomic_get(&app->stop_flag);
 }

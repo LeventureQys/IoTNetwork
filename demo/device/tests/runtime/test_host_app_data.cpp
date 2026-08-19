@@ -160,3 +160,67 @@ TEST_F(AppDataTest, InjectFaultQueuedAndExecuted)
     EXPECT_EQ(device_host_join(h, 5000, &e), DEVICE_OK);
     DestroyHost(&h);
 }
+
+TEST_F(AppDataTest, SerialBytesLengthValidation)
+{
+    std::string cfg_path;
+    device_host_options_t o = MakeOptions(dir, &cfg_path);
+    device_host_t *h = CreateHost(o);
+    device_error_t e;
+    uint8_t chunk[PROTO_V2_SERIAL_CHUNK_MAX + 1];
+    memset(chunk, 0xAB, sizeof(chunk));
+    EXPECT_EQ(device_host_send_serial_bytes(h, chunk, sizeof(chunk), &e),
+              DEVICE_ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(device_host_send_serial_bytes(h, chunk, 0, &e),
+              DEVICE_ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(device_host_send_serial_bytes(h, nullptr, 5, &e),
+              DEVICE_ERR_INVALID_ARGUMENT);
+    DestroyHost(&h);
+}
+
+TEST_F(AppDataTest, SerialBytesNotRunningInvalidState)
+{
+    std::string cfg_path;
+    device_host_options_t o = MakeOptions(dir, &cfg_path);
+    device_host_t *h = CreateHost(o);
+    device_error_t e;
+    uint8_t chunk[5] = {1, 2, 3, 4, 5};
+    EXPECT_EQ(device_host_send_serial_bytes(h, chunk, sizeof(chunk), &e),
+              DEVICE_ERR_INVALID_STATE);
+    DestroyHost(&h);
+}
+
+TEST_F(AppDataTest, SerialBytesSendOk)
+{
+    device_host_t *h = StartSessionHost(dir);
+    device_error_t e;
+    uint8_t chunk[100];
+    for (int i = 0; i < 100; i++)
+        chunk[i] = (uint8_t)i;
+    /* 二进制含 NUL 与 0xFF，不应被截断或改写 */
+    EXPECT_EQ(device_host_send_serial_bytes(h, chunk, sizeof(chunk), &e), DEVICE_OK);
+    EXPECT_EQ(device_host_send_serial_bytes(h, chunk, sizeof(chunk), &e), DEVICE_OK);
+    EXPECT_EQ(device_host_request_stop(h), DEVICE_OK);
+    EXPECT_EQ(device_host_join(h, 5000, &e), DEVICE_OK);
+    DestroyHost(&h);
+}
+
+TEST_F(AppDataTest, SerialBytesQueueFullBusy)
+{
+    device_host_t *h = StartSessionHost(dir);
+    device_runner_test_cmd_hold_ms = 1000;
+    device_error_t e;
+    uint8_t chunk[64];
+    memset(chunk, 0x5A, sizeof(chunk));
+    bool saw_busy = false;
+    for (int i = 0; i < 40; i++) {
+        device_result_t rc = device_host_send_serial_bytes(h, chunk, sizeof(chunk), &e);
+        if (rc == DEVICE_ERR_BUSY)
+            saw_busy = true;
+    }
+    EXPECT_TRUE(saw_busy);
+    device_runner_test_cmd_hold_ms = 0;
+    EXPECT_EQ(device_host_request_stop(h), DEVICE_OK);
+    EXPECT_EQ(device_host_join(h, 10000, &e), DEVICE_OK);
+    DestroyHost(&h);
+}

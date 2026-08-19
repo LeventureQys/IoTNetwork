@@ -15,6 +15,7 @@ extern "C" {
 
 typedef enum device_cmd_kind {
     DEVICE_CMD_APP_DATA = 0,
+    DEVICE_CMD_SERIAL_BYTES,
     DEVICE_CMD_INJECT_FAULT
 } device_cmd_kind_t;
 
@@ -24,6 +25,10 @@ typedef struct device_cmd {
     size_t app_data_len;
     char fault_action[64];
     char fault_argument[512];
+    /* 二进制串口 chunk。所有权随 push 转移给队列，随 pop 转移给消费者；
+     * 消费者必须 free。仅 DEVICE_CMD_SERIAL_BYTES 使用。 */
+    uint8_t *serial_data;
+    size_t serial_len;
 } device_cmd_t;
 
 typedef struct device_mutex device_mutex_t;

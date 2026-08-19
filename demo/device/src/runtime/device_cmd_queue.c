@@ -31,6 +31,11 @@ void device_cmd_queue_destroy(device_cmd_queue_t *q)
 {
     if (q == NULL)
         return;
+    for (size_t i = 0; i < q->count; i++) {
+        size_t idx = (q->head + i) % DEVICE_CMD_QUEUE_CAPACITY;
+        free(q->slots[idx].serial_data);
+        q->slots[idx].serial_data = NULL;
+    }
     q->plat->mutex_destroy(q->mutex);
     free(q);
 }

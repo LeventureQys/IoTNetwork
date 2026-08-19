@@ -21,6 +21,14 @@ typedef struct device_app device_app_t;
 #define DEVICE_EVLOG_TEXT_MAX 95
 #define DEVICE_SCAN_MAX_APS 32
 
+/* wire v2 发送队列（runner 单线程，无锁）。 */
+#define DEV_TX_QUEUE_CAP 64
+
+struct dev_tx_item {
+    uint8_t *data;   /* malloc 编码后的完整帧（所有权归队列） */
+    int len;
+};
+
 struct device_app {
     const device_config_t *params;
     net_ctx_t *net;
@@ -82,6 +90,15 @@ struct device_app {
     uint8_t rx_buf[PROTO_MSG_MAX_LEN + PROTO_FRAME_HEAD_LEN + 1];
     int rx_len;
     void *rx_sock;
+
+    /* wire v2 发送队列与 in-flight（partial write 续传） */
+    struct dev_tx_item tx_queue[DEV_TX_QUEUE_CAP];
+    int tx_head;
+    int tx_count;
+    uint8_t *tx_inflight_data;
+    int tx_inflight_len;
+    int tx_inflight_off;
+    uint64_t tx_sequence;
 
     /* 结构化事件上报 sink（runtime 注入；核心只负责埋点调用，不关心实现）。
      * ev_fn 可为 NULL（未指定 --events-jsonl / 无 scenario 时为空）。 */

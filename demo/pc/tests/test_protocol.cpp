@@ -17,6 +17,18 @@ TEST(Protocol, Constants)
     EXPECT_EQ(APP_DATA_TEXT_MAX, 512);
 }
 
+TEST(Protocol, WireV2Constants)
+{
+    EXPECT_EQ(PROTO_WIRE_VERSION, 2);
+    EXPECT_EQ(PROTO_V2_HEAD_LEN, 4);
+    EXPECT_EQ(PROTO_V2_BODY_HEAD_LEN, 12);
+    EXPECT_EQ(PROTO_V2_FRAME_MAX_LEN, 65536);
+    EXPECT_EQ(PROTO_V2_CONTROL_MAX_LEN, 4096);
+    EXPECT_EQ(PROTO_V2_SERIAL_CHUNK_MAX, 16384);
+    EXPECT_EQ(PROTO_V2_TYPE_CONTROL_JSON, 1);
+    EXPECT_EQ(PROTO_V2_TYPE_SERIAL_BYTES, 2);
+}
+
 TEST(Protocol, StateStr)
 {
     EXPECT_STREQ(device_state_str(DEV_STATE_BOOT), "boot");
@@ -41,12 +53,13 @@ TEST(Protocol, StateEnumValues)
 
 TEST(Protocol, CommandNames)
 {
-    /* beta v1.1：仅保留握手/心跳/应用数据 5 条命令 */
+    /* wire v2：握手/心跳/错误命令；app_data 保留历史兼容，生产数据面走 SERIAL_BYTES */
     EXPECT_STREQ(CMD_DEVICE_HELLO, "device_hello");
     EXPECT_STREQ(CMD_HOST_ACK, "host_ack");
     EXPECT_STREQ(CMD_PING, "ping");
     EXPECT_STREQ(CMD_PONG, "pong");
     EXPECT_STREQ(CMD_APP_DATA, "app_data");
+    EXPECT_STREQ(CMD_ERROR, "error");
 }
 
 TEST(Protocol, ReasonCodes)

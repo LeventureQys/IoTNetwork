@@ -17,7 +17,7 @@ Windows PC                                 Linux Device
      SSID=Modu_PC（Modu_ 前缀）              3. 用密码 modu_leventure 连接
   3. 固定热点 IP=192.168.137.1/24            4. 直连 192.168.137.1:5935
   4. 监听 0.0.0.0:5935（唯一设备）           5. device_hello → host_ack
-                                            6. ping/pong 心跳 + app_data
+                                            6. ping/pong 心跳 + 二进制串口数据（SERIAL_BYTES）
                                             （失败退避重连，六态状态机自愈）
 ```
 
@@ -101,9 +101,9 @@ ctest --test-dir out/device-build -C Debug --output-on-failure
 
 | 测试类型 | 用例数 | 状态 |
 |----------|--------|------|
-| PC 单元/UI/契约测试 | 146（120+3+23） | 通过 |
-| 设备单元/组件测试 | 134 | 通过（runtime/config/core/sim/linux/esp32/ui） |
-| 跨端集成测试（sim 双进程） | 8 场景（a–h） | 通过（契约一致/热点直连会话/PC 退出/断线重连/第二设备拒绝/无目标/应用数据/帧边界） |
+| PC 单元/UI/契约测试 | 135 unit + UI + contract | 通过（wire v2 frame/contract/session/partial write） |
+| 设备单元/组件测试 | 154 | 通过（runtime/config/core/sim/linux/esp32/ui） |
+| 跨端集成测试（sim 双进程） | 8 场景（a–h） | beta v1.1 通过（契约一致/热点直连会话/PC 退出/断线重连/第二设备拒绝/无目标/应用数据/帧边界）；wire v2 高频/背压属 v2.2-pre.1 Stage D1 |
 | Windows 真实热点 | — | **部分验证 + 阻塞**：WinRT 热点启动已实测成功；固定 IP `192.168.137.1/24` 改写需管理员权限（阶段三问题清单 CQ7） |
 | Linux 真实设备 | — | **阻塞**：本机无 nmcli/无线网卡/Linux 环境（阶段三问题清单 CQ4） |
 

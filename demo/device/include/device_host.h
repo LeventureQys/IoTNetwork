@@ -96,6 +96,12 @@ device_result_t device_host_destroy(device_host_t **host, device_error_t *error)
 device_result_t device_host_get_state(const device_host_t *host, device_host_state_t *out_state);
 device_result_t device_host_get_snapshot(const device_host_t *host, device_snapshot_t *out_snapshot);
 device_result_t device_host_send_app_data(device_host_t *host, const char *utf8_text, size_t text_length, device_error_t *error);
+
+/* wire v2：提交一段不透明二进制串口字节流（1..PROTO_V2_SERIAL_CHUNK_MAX）。
+ * 调用时复制入有界队列；成功仅表示 accepted，不表示已写 socket。
+ * 队列满返回 DEVICE_ERR_BUSY；非会话态返回 DEVICE_ERR_INVALID_STATE。 */
+device_result_t device_host_send_serial_bytes(device_host_t *host, const uint8_t *bytes,
+                                              size_t length, device_error_t *error);
 device_result_t device_host_inject_fault(device_host_t *host, const char *action, const char *argument_json, device_error_t *error);
 device_result_t device_host_drain_logs(device_host_t *host, device_log_record_t *records, size_t capacity, size_t *out_count, uint64_t *out_dropped);
 

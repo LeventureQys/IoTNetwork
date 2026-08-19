@@ -36,6 +36,11 @@ void device_app_sha256_hex(const char *text, size_t len, char out_hex[65]);
  * 返回 DEMO_OK=已发送；DEMO_ERR=非会话态/限速/发送失败。 */
 int device_app_tx_text(device_app_t *app, const char *text);
 
+/* device 线程专用：把一段串口字节流编码为 SERIAL_BYTES 帧并入发送队列。
+ * 返回 DEMO_OK=已入队；DEMO_ERR=队列满；DEMO_ERR_INVAL=长度非法；
+ * DEMO_ERR_NOMEM=分配失败。由 device_app_flush_tx 在下一轮冲刷发送。 */
+int device_app_enqueue_serial_bytes(device_app_t *app, const uint8_t *bytes, size_t len);
+
 /* 收包统一入口（仅业务会话）：帧解析 + 畸形计数 + cmd 分发 */
 void device_app_handle_rx(device_app_t *app, void *sock);
 
@@ -44,6 +49,9 @@ int  device_send_frame(device_app_t *app, void *sock, cJSON *obj);
 int  device_send_frame_raw(device_app_t *app, void *sock, const char *json);
 void device_set_state(device_app_t *app, device_state_t s);
 void device_sleep_ms(int ms);
+
+/* 清空发送队列与 in-flight（断线/新连接时调用；不跨 session 重放字节流）。 */
+void device_app_tx_clear(device_app_t *app);
 
 #ifdef __cplusplus
 }

@@ -1,11 +1,18 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "generated_from": "device/include/protocol.h",
   "protocol_version": 1,
+  "wire_version": 2,
   "frame": {
-    "prefix_bytes": 2,
+    "head_bytes": 4,
+    "body_bytes": 12,
     "byte_order": "big",
-    "max_payload": 1024
+    "max_total_length": 65536,
+    "sequence_bytes": 8,
+    "types": {
+      "control_json": 1,
+      "serial_bytes": 2
+    }
   },
   "tcp": {
     "host_ip": "192.168.137.1",
@@ -19,6 +26,8 @@
     "prefix_length": 24
   },
   "limits": {
+    "control_json_bytes": 4096,
+    "serial_chunk_bytes": 16384,
     "app_data_text_bytes": 512,
     "session_id_length": 8
   },
@@ -27,8 +36,13 @@
     "host_ack",
     "ping",
     "pong",
-    "app_data"
+    "error"
   ],
+  "serial_profile": {
+    "required_fields": ["frame_size", "rows", "cols", "data_points", "value_domain"],
+    "value_domain": ["raw_adc"],
+    "rules": "frame_size == 4 + data_points * 2; rows * cols == data_points"
+  },
   "device_states": {
     "boot": 0,
     "wifi_scan": 1,

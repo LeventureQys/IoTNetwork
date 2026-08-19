@@ -25,16 +25,17 @@ namespace {
 
 const int kPort = 55956;
 
-int send_json(net_ctx_t *ctx, void *sock, const char *json)
+int v2_send_control(net_ctx_t *ctx, void *sock, uint64_t seq, const char *json)
 {
-    uint8_t frame[PROTO_MSG_MAX_LEN + PROTO_FRAME_HEAD_LEN];
-    int n = frame_wrap((const uint8_t *)json, (int)strlen(json), frame, (int)sizeof(frame));
+    uint8_t frame[PROTO_V2_HEAD_LEN + PROTO_V2_BODY_HEAD_LEN + 2048];
+    int n = frame_v2_wrap(PROTO_V2_TYPE_CONTROL_JSON, seq, (const uint8_t *)json,
+                          (int)strlen(json), frame, (int)sizeof(frame));
     if (n < 0)
         return n;
     return net_sock_send(ctx, sock, frame, n);
 }
 
-bool recv_json(net_ctx_t *ctx, void *sock, std::string *out, int timeout_ms)
+bool v2_recv_control(net_ctx_t *ctx, void *sock, std::string *out, int timeout_ms)
 {
     std::vector<uint8_t> rx;
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
@@ -48,14 +49,22 @@ bool recv_json(net_ctx_t *ctx, void *sock, std::string *out, int timeout_ms)
         if (n <= 0)
             return false;
         rx.insert(rx.end(), buf, buf + n);
-        int off = 0, len = 0, consumed = 0;
-        int r = frame_parse(rx.data(), (int)rx.size(), &off, &len, &consumed);
-        if (r == 1) {
-            out->assign(reinterpret_cast<const char *>(rx.data() + off), (size_t)len);
-            return true;
+        while (!rx.empty()) {
+            int type = 0, plen = 0, consumed = 0;
+            uint64_t seq = 0;
+            const uint8_t *pp = nullptr;
+            int r = frame_v2_parse(rx.data(), (int)rx.size(), &type, &seq, &pp, &plen,
+                                   &consumed);
+            if (r == 0)
+                break;
+            if (r < 0)
+                return false;
+            if (type == PROTO_V2_TYPE_CONTROL_JSON) {
+                out->assign(reinterpret_cast<const char *>(pp), (size_t)plen);
+                return true;
+            }
+            rx.erase(rx.begin(), rx.begin() + consumed);
         }
-        if (r == DEMO_ERR)
-            return false;
     }
     return false;
 }
@@ -69,6 +78,17 @@ struct SessionFixture {
     HostRegistry registry;
     HostTcpServer *server = nullptr;
     uint64_t now = 1000;
+    uint64_t dev_seq = 0;
+
+    int SendControl(void *sock, const char *json)
+    {
+        return v2_send_control(dev_ctx, sock, ++dev_seq, json);
+    }
+
+    bool RecvControl(void *sock, std::string *out, int timeout_ms)
+    {
+        return v2_recv_control(dev_ctx, sock, out, timeout_ms);
+    }
 
     void Init()
     {
@@ -116,18 +136,20 @@ struct SessionFixture {
 
     /* 握手并返回 ack JSON；session_id 可选（用于恢复） */
     std::string Handshake(void *sock, const char *id, const char *session_id = nullptr,
-                          int proto_ver = PROTO_VERSION)
+                          int proto_ver = PROTO_WIRE_VERSION)
     {
         std::string hello = std::string("{\"cmd\":\"device_hello\",\"id\":\"") + id +
                             "\",\"fw_version\":\"1.1.0\",\"proto_ver\":" +
                             std::to_string(proto_ver) + ",\"uptime\":10";
+        hello += ",\"serial_profile\":{\"frame_size\":16,\"rows\":2,\"cols\":3,"
+                 "\"data_points\":6,\"value_domain\":\"raw_adc\"}";
         if (session_id)
             hello += std::string(",\"session_id\":\"") + session_id + "\"";
         hello += "}";
-        send_json(dev_ctx, sock, hello.c_str());
+        SendControl(sock, hello.c_str());
         server->Poll(now);
         std::string ack;
-        recv_json(dev_ctx, sock, &ack, 1000);
+        RecvControl(sock, &ack, 1000);
         return ack;
     }
 };
@@ -165,12 +187,12 @@ TEST(HostSession, HelloMissingRequiredFieldIsMalformed)
     ASSERT_NE(sock, nullptr);
     f.server->Poll(f.now);
     /* 缺少 fw_version */
-    send_json(f.dev_ctx, sock,
-              "{\"cmd\":\"device_hello\",\"id\":\"02:00:00:00:00:01\","
-              "\"proto_ver\":1,\"uptime\":10}");
+    f.SendControl(sock,
+                  "{\"cmd\":\"device_hello\",\"id\":\"02:00:00:00:00:01\","
+                  "\"proto_ver\":1,\"uptime\":10}");
     f.server->Poll(f.now);
     std::string ack;
-    EXPECT_FALSE(recv_json(f.dev_ctx, sock, &ack, 300));
+    EXPECT_FALSE(f.RecvControl(sock, &ack, 300));
     EXPECT_EQ(f.registry.Size(), (size_t)0);
     net_sock_close(f.dev_ctx, sock);
     f.Cleanup();
@@ -183,7 +205,7 @@ TEST(HostSession, ProtoVersionUnsupported)
     void *sock = f.ConnectClient();
     ASSERT_NE(sock, nullptr);
     f.server->Poll(f.now);
-    std::string ack = f.Handshake(sock, "02:00:00:00:00:01", nullptr, 2);
+    std::string ack = f.Handshake(sock, "02:00:00:00:00:01", nullptr, 1);
     cJSON *json = cJSON_Parse(ack.c_str());
     ASSERT_NE(json, nullptr);
     EXPECT_STREQ(cJSON_GetObjectItemCaseSensitive(json, "status")->valuestring, "fail");
@@ -208,7 +230,7 @@ TEST(HostSession, SecondConnectionBusyKeepsFirstOnline)
     ASSERT_NE(sock2, nullptr);
     f.server->Poll(f.now); /* accept 阶段拒绝第二连接 */
     std::string ack2;
-    ASSERT_TRUE(recv_json(f.dev_ctx, sock2, &ack2, 1000));
+    ASSERT_TRUE(f.RecvControl(sock2, &ack2, 1000));
     cJSON *json = cJSON_Parse(ack2.c_str());
     ASSERT_NE(json, nullptr);
     EXPECT_STREQ(cJSON_GetObjectItemCaseSensitive(json, "status")->valuestring, "busy");
@@ -246,7 +268,7 @@ TEST(HostSession, SameIdOnlineReconnectRejected)
     ASSERT_NE(sock2, nullptr);
     f.server->Poll(f.now);
     std::string ack2;
-    ASSERT_TRUE(recv_json(f.dev_ctx, sock2, &ack2, 1000));
+    ASSERT_TRUE(f.RecvControl(sock2, &ack2, 1000));
     EXPECT_TRUE(ack2.find("single_device_only") != std::string::npos);
 
     DeviceEntry *first = f.registry.Find("02:00:00:00:00:01");
@@ -303,10 +325,10 @@ TEST(HostSession, PingEchoesSeq)
     ASSERT_NE(sock, nullptr);
     f.server->Poll(f.now);
     f.Handshake(sock, "02:00:00:00:00:01");
-    send_json(f.dev_ctx, sock, "{\"cmd\":\"ping\",\"seq\":42}");
+    f.SendControl(sock, "{\"cmd\":\"ping\",\"seq\":42}");
     f.server->Poll(f.now);
     std::string pong;
-    ASSERT_TRUE(recv_json(f.dev_ctx, sock, &pong, 1000));
+    ASSERT_TRUE(f.RecvControl(sock, &pong, 1000));
     cJSON *json = cJSON_Parse(pong.c_str());
     ASSERT_NE(json, nullptr);
     EXPECT_STREQ(cJSON_GetObjectItemCaseSensitive(json, "cmd")->valuestring, "pong");
@@ -351,9 +373,9 @@ TEST(HostSession, AppDataRxUtf8ByteCount)
     f.server->Poll(f.now);
     f.Handshake(sock, "02:00:00:00:00:01");
     /* "你好" 为 6 字节 UTF-8 */
-    send_json(f.dev_ctx, sock,
-              "{\"cmd\":\"app_data\",\"seq\":1,\"data\":{\"type\":\"debug_text\","
-              "\"text\":\"\xe4\xbd\xa0\xe5\xa5\xbd\"}}");
+    f.SendControl(sock,
+                  "{\"cmd\":\"app_data\",\"seq\":1,\"data\":{\"type\":\"debug_text\","
+                  "\"text\":\"\xe4\xbd\xa0\xe5\xa5\xbd\"}}");
     f.server->Poll(f.now);
     net_sock_close(f.dev_ctx, sock);
     f.Cleanup();

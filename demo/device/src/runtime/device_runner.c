@@ -82,6 +82,16 @@ static void runner_process_commands(device_host_t *h)
                 h->pending_app_data_len = cmd.app_data_len;
                 h->pending_app_data_valid = 1;
             }
+        } else if (cmd.kind == DEVICE_CMD_SERIAL_BYTES) {
+            if (cmd.serial_data != NULL && cmd.serial_len > 0) {
+                if (device_app_enqueue_serial_bytes(h->app, cmd.serial_data,
+                                                    cmd.serial_len) != DEMO_OK) {
+                    /* 非会话态/队列满：丢弃该 chunk（不跨 session 重放） */
+                    LOG_D(h->device_id, "串口字节 chunk 丢弃（非会话态或队列满）");
+                }
+            }
+            free(cmd.serial_data);
+            cmd.serial_data = NULL;
         } else if (cmd.kind == DEVICE_CMD_INJECT_FAULT) {
             int rc = net_inject(h->net, cmd.fault_action, cmd.fault_argument);
             char data[160];

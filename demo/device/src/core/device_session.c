@@ -26,16 +26,24 @@ int session_connect(device_app_t *app, const net_addr_t *host)
     app->ping_seq = 0;
     app->malformed_count = 0;
     app->rx_len = 0; /* 新连接重置帧缓冲（跨连接残留会错乱解析） */
+    app->tx_sequence = 0; /* 新 session 发送序列号归零 */
+    device_app_tx_clear(app); /* 丢弃上一 session 未发送字节流 */
 
-    /* device_hello（beta v1.1：仅 id/fw_version/proto_ver/uptime + 可选 session_id） */
+    /* device_hello（wire v2：携带 serial_profile，供 PC 配置串口解码） */
     cJSON *hello = cJSON_CreateObject();
     cJSON_AddStringToObject(hello, "cmd", CMD_DEVICE_HELLO);
     cJSON_AddStringToObject(hello, "id", app->device_id);
     cJSON_AddStringToObject(hello, "fw_version", app->params->device_fw_version);
-    cJSON_AddNumberToObject(hello, "proto_ver", app->params->device_proto_ver);
+    cJSON_AddNumberToObject(hello, "proto_ver", PROTO_WIRE_VERSION);
     cJSON_AddNumberToObject(hello, "uptime", device_app_uptime_s(app));
     if (app->session_id[0] != '\0')
         cJSON_AddStringToObject(hello, "session_id", app->session_id);
+    cJSON *sp = cJSON_AddObjectToObject(hello, "serial_profile");
+    cJSON_AddNumberToObject(sp, "frame_size", app->params->serial_frame_size);
+    cJSON_AddNumberToObject(sp, "rows", app->params->serial_rows);
+    cJSON_AddNumberToObject(sp, "cols", app->params->serial_cols);
+    cJSON_AddNumberToObject(sp, "data_points", app->params->serial_data_points);
+    cJSON_AddStringToObject(sp, "value_domain", "raw_adc");
     rc = device_send_frame(app, sock, hello);
     cJSON_Delete(hello);
     if (rc != DEMO_OK) {
@@ -198,6 +206,7 @@ void session_on_conn_closed(device_app_t *app)
         app->err_tcp_drops++;
         LOG_W(app->device_id, "会话：连接已被对端关闭");
     }
+    device_app_tx_clear(app);
 }
 
 void session_disconnect(device_app_t *app)
@@ -206,4 +215,5 @@ void session_disconnect(device_app_t *app)
         net_sock_close(app->net, app->sess_sock);
         app->sess_sock = NULL;
     }
+    device_app_tx_clear(app); /* 断线丢弃未发送帧，不跨 session 重放 */
 }

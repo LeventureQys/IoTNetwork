@@ -38,6 +38,11 @@ typedef struct device_config {
     /* 设备元信息 */
     char  device_fw_version[16];
     int   device_proto_ver;
+    /* serial profile（wire v2 hello 携带；业务层输入）。frame_size==4+points*2 */
+    int   serial_frame_size;
+    int   serial_rows;
+    int   serial_cols;
+    int   serial_data_points;
     /* 运行 */
     int   duration_s;
     char  scenario_path[512];

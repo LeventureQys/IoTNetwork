@@ -27,6 +27,22 @@ extern "C" {
 #define CMD_PING          "ping"
 #define CMD_PONG          "pong"
 #define CMD_APP_DATA      "app_data"
+#define CMD_ERROR         "error"
+
+/* ── wire v2：控制面 JSON 与二进制串口字节流分离 ──
+ * 帧结构：[total_length u32 BE][frame_type u8][flags u8][reserved u16 BE]
+ *         [sequence u64 BE][payload N]
+ * total_length = 12 + N（从 frame_type 到 payload 末尾，不含自身 4 字节）。
+ * 与 demo/device/include/protocol.h 完全一致，禁止单端私自修改值。 */
+#define PROTO_WIRE_VERSION          2
+#define PROTO_V2_HEAD_LEN           4
+#define PROTO_V2_BODY_HEAD_LEN      12
+#define PROTO_V2_FRAME_MAX_LEN      65536
+#define PROTO_V2_CONTROL_MAX_LEN    4096
+#define PROTO_V2_SERIAL_CHUNK_MAX   16384
+
+#define PROTO_V2_TYPE_CONTROL_JSON  1
+#define PROTO_V2_TYPE_SERIAL_BYTES  2
 
 typedef enum {
     WIFI_REASON_OK             = 0,

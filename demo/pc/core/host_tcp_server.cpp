@@ -43,8 +43,41 @@ static void emit_app_data_event(const char *event, const char *device_id, const 
     pc_events_emit(&ev);
 }
 
-HostTcpServer::HostTcpServer(net_ctx_t *net, HostRegistry &reg, const demo_params_t &params)
-    : net_(net), reg_(reg), params_(params)
+static bool ParseSerialProfile(const cJSON *json, HostSerialProfile *out)
+{
+    const cJSON *sp = cJSON_GetObjectItemCaseSensitive(json, "serial_profile");
+    if (!cJSON_IsObject(sp))
+        return false;
+    const cJSON *fs = cJSON_GetObjectItemCaseSensitive(sp, "frame_size");
+    const cJSON *rows = cJSON_GetObjectItemCaseSensitive(sp, "rows");
+    const cJSON *cols = cJSON_GetObjectItemCaseSensitive(sp, "cols");
+    const cJSON *dp = cJSON_GetObjectItemCaseSensitive(sp, "data_points");
+    const cJSON *vd = cJSON_GetObjectItemCaseSensitive(sp, "value_domain");
+    if (!cJSON_IsNumber(fs) || !cJSON_IsNumber(rows) || !cJSON_IsNumber(cols) ||
+        !cJSON_IsNumber(dp) || !cJSON_IsString(vd))
+        return false;
+    if (strcmp(vd->valuestring, "raw_adc") != 0)
+        return false;
+    uint32_t frame_size = (uint32_t)fs->valueint;
+    uint32_t data_points = (uint32_t)dp->valueint;
+    uint32_t r = (uint32_t)rows->valueint;
+    uint32_t c = (uint32_t)cols->valueint;
+    if (frame_size < 6 || r == 0 || c == 0)
+        return false;
+    if (frame_size != 4 + data_points * 2)
+        return false;
+    if (r * c != data_points)
+        return false;
+    out->frame_size = frame_size;
+    out->rows = (uint16_t)r;
+    out->cols = (uint16_t)c;
+    out->data_points = data_points;
+    return true;
+}
+
+HostTcpServer::HostTcpServer(net_ctx_t *net, HostRegistry &reg, const demo_params_t &params,
+                             IHostDataSink *sink)
+    : net_(net), reg_(reg), params_(params), sink_(sink)
 {
 }
 
@@ -89,30 +122,127 @@ std::string HostTcpServer::NewSessionId()
 
 int HostTcpServer::SendFrame(void *sock, cJSON *obj)
 {
+    if (sock == nullptr || obj == nullptr)
+        return DEMO_ERR_INVAL;
     char *s = cJSON_PrintUnformatted(obj);
     if (!s)
         return DEMO_ERR_NOMEM;
-    uint8_t frame[PROTO_MSG_MAX_LEN + PROTO_FRAME_HEAD_LEN];
-    int n = frame_wrap((const uint8_t *)s, (int)strlen(s), frame, (int)sizeof(frame));
-    int rc = n < 0 ? n : net_sock_send(net_, sock, frame, n);
-    if (rc >= 0)
+    SendCtx &ctx = send_ctx_[sock];
+    std::vector<uint8_t> frame((size_t)(PROTO_V2_HEAD_LEN + PROTO_V2_BODY_HEAD_LEN +
+                                        strlen(s)));
+    uint64_t seq = ++ctx.tx_sequence;
+    int n = frame_v2_wrap(PROTO_V2_TYPE_CONTROL_JSON, seq,
+                          (const uint8_t *)s, (int)strlen(s),
+                          frame.data(), (int)frame.size());
+    if (n >= 0)
         LOG_I("HOST", "TX %s", s);
     free(s);
-    return rc >= 0 ? DEMO_OK : rc;
+    if (n < 0)
+        return n;
+    frame.resize((size_t)n);
+    ctx.queue.push_back(std::move(frame));
+    return DEMO_OK;
 }
 
-static int parse_frames(std::vector<uint8_t> &rx, cJSON **out)
+int HostTcpServer::SendSerialBytes(void *sock, const uint8_t *bytes, size_t length)
 {
-    int off = 0, len = 0, consumed = 0;
-    int rc = frame_parse(rx.data(), (int)rx.size(), &off, &len, &consumed);
+    if (sock == nullptr || bytes == nullptr || length == 0 ||
+        length > PROTO_V2_SERIAL_CHUNK_MAX)
+        return DEMO_ERR_INVAL;
+    SendCtx &ctx = send_ctx_[sock];
+    std::vector<uint8_t> frame((size_t)(PROTO_V2_HEAD_LEN + PROTO_V2_BODY_HEAD_LEN +
+                                        length));
+    uint64_t seq = ++ctx.tx_sequence;
+    int n = frame_v2_wrap(PROTO_V2_TYPE_SERIAL_BYTES, seq, bytes, (int)length,
+                          frame.data(), (int)frame.size());
+    if (n < 0)
+        return n;
+    frame.resize((size_t)n);
+    ctx.queue.push_back(std::move(frame));
+    return DEMO_OK;
+}
+
+void HostTcpServer::FlushTx()
+{
+    for (auto it = send_ctx_.begin(); it != send_ctx_.end();) {
+        SendCtx &ctx = it->second;
+        void *sock = it->first;
+        bool fatal = false;
+
+        if (!ctx.inflight.empty()) {
+            int n = net_sock_send(net_, sock, ctx.inflight.data() + ctx.inflight_off,
+                                  (int)(ctx.inflight.size() - ctx.inflight_off));
+            if (n == DEMO_ERR_AGAIN) {
+                ++it;
+                continue;
+            }
+            if (n <= 0) {
+                fatal = true;
+            } else {
+                ctx.inflight_off += (size_t)n;
+                if (ctx.inflight_off >= ctx.inflight.size()) {
+                    ctx.inflight.clear();
+                    ctx.inflight_off = 0;
+                } else {
+                    ++it;
+                    continue;
+                }
+            }
+        }
+
+        while (!fatal && !ctx.queue.empty()) {
+            std::vector<uint8_t> frame = std::move(ctx.queue.front());
+            ctx.queue.pop_front();
+            int n = net_sock_send(net_, sock, frame.data(), (int)frame.size());
+            if (n == DEMO_ERR_AGAIN) {
+                ctx.inflight = std::move(frame);
+                ctx.inflight_off = 0;
+                break;
+            }
+            if (n <= 0) {
+                fatal = true;
+                break;
+            }
+            if ((size_t)n < frame.size()) {
+                ctx.inflight = std::move(frame);
+                ctx.inflight_off = (size_t)n;
+                break;
+            }
+        }
+
+        if (fatal) {
+            net_sock_close(net_, sock);
+            it = send_ctx_.erase(it);
+            continue;
+        }
+        ++it;
+    }
+}
+
+struct ParsedFrame {
+    int type = 0;
+    uint64_t sequence = 0;
+    std::vector<uint8_t> payload;
+};
+
+static int parse_v2_frames(std::vector<uint8_t> &rx, ParsedFrame *out)
+{
+    int type = 0, plen = 0, consumed = 0;
+    uint64_t seq = 0;
+    const uint8_t *pp = nullptr;
+    int rc = frame_v2_parse(rx.data(), (int)rx.size(), &type, &seq, &pp, &plen, &consumed);
     if (rc == 0)
         return 0;
-    if (rc == DEMO_ERR) {
-        rx.erase(rx.begin(), rx.begin() + consumed);
+    if (rc < 0) {
+        if (consumed <= 0)
+            rx.clear();
+        else
+            rx.erase(rx.begin(), rx.begin() + consumed);
         return -1;
     }
-    std::string payload((const char *)(rx.data() + off), (size_t)len);
-    *out = cJSON_Parse(payload.c_str());
+    out->type = type;
+    out->sequence = seq;
+    out->payload.assign(pp, pp + plen);
     rx.erase(rx.begin(), rx.begin() + consumed);
     return 1;
 }
@@ -135,6 +265,8 @@ void HostTcpServer::RejectBusy(void *conn)
     SendFrame(conn, ack);
     cJSON_Delete(ack);
     LOG_W("HOST", "第二连接被拒绝：single_device_only");
+    FlushTx(); /* 尽力发送 busy ack 后再关闭 */
+    send_ctx_.erase(conn);
     net_sock_close(net_, conn);
     pc_event_t ev;
     memset(&ev, 0, sizeof(ev));
@@ -203,11 +335,20 @@ void HostTcpServer::Poll(uint64_t now_ms)
     for (const std::string &id : reg_.FindDead(now_ms, dead_ms)) {
         DeviceEntry *e = reg_.Find(id);
         LOG_W("HOST", "设备因心跳超时离线：%s", id.c_str());
-        if (e && e->conn) {
-            net_sock_close(net_, e->conn);
-            e->conn = nullptr;
+        std::string session_id;
+        if (e) {
+            session_id = e->session_id;
+            if (e->conn) {
+                void *conn = e->conn;
+                net_sock_close(net_, conn);
+                send_ctx_.erase(conn);
+                conn_rx_.erase(conn);
+                e->conn = nullptr;
+            }
         }
         reg_.MarkOffline(id);
+        if (sink_)
+            sink_->OnSessionOffline(id, session_id, "heartbeat_timeout");
         pc_event_t ev;
         memset(&ev, 0, sizeof(ev));
         ev.event = "session_offline";
@@ -220,6 +361,8 @@ void HostTcpServer::Poll(uint64_t now_ms)
 
     /* 冲刷 UI 入队的联调消息（app_data） */
     FlushPendingTx();
+    /* 冲刷发送队列（控制 + 数据，处理 partial write / EAGAIN） */
+    FlushTx();
 }
 
 int HostTcpServer::QueueAppData(const std::string &device_id, const std::string &text)
@@ -274,13 +417,26 @@ void HostTcpServer::HandlePending(PendingConn &pc, uint64_t now_ms)
     }
     pc.rx.insert(pc.rx.end(), buf, buf + n);
     while (!pc.rx.empty()) {
-        cJSON *json = nullptr;
-        int rc = parse_frames(pc.rx, &json);
+        ParsedFrame frame;
+        int rc = parse_v2_frames(pc.rx, &frame);
         if (rc == 0)
             break;
-        if (rc == DEMO_ERR) {
+        if (rc < 0) {
             pc.malformed++;
             LOG_W("HOST", "待注册连接收到畸形帧（%d）", pc.malformed);
+            continue;
+        }
+        if (frame.type != PROTO_V2_TYPE_CONTROL_JSON) {
+            LOG_W("HOST", "握手前收到 SERIAL_BYTES，协议错误，关闭连接");
+            net_sock_close(net_, pc.sock);
+            pc.sock = nullptr;
+            break;
+        }
+        cJSON *json = cJSON_ParseWithLength((const char *)frame.payload.data(),
+                                            frame.payload.size());
+        if (json == nullptr) {
+            pc.malformed++;
+            LOG_W("HOST", "控制帧 JSON 解析失败");
             continue;
         }
         const cJSON *cmd = cJSON_GetObjectItemCaseSensitive(json, "cmd");
@@ -291,7 +447,6 @@ void HostTcpServer::HandlePending(PendingConn &pc, uint64_t now_ms)
             const cJSON *pv = cJSON_GetObjectItemCaseSensitive(json, "proto_ver");
             const cJSON *fw = cJSON_GetObjectItemCaseSensitive(json, "fw_version");
             const cJSON *upt = cJSON_GetObjectItemCaseSensitive(json, "uptime");
-            /* beta v1.1：必需字段 id/fw_version/proto_ver/uptime；session_id 可选 */
             if (!cJSON_IsString(id) || !cJSON_IsNumber(pv) || !cJSON_IsString(fw) ||
                 !cJSON_IsNumber(upt)) {
                 pc.malformed++;
@@ -299,8 +454,7 @@ void HostTcpServer::HandlePending(PendingConn &pc, uint64_t now_ms)
                 cJSON_Delete(json);
                 continue;
             }
-            /* 协议版本协商 */
-            if (pv->valueint != PROTO_VERSION) {
+            if (pv->valueint != PROTO_WIRE_VERSION) {
                 cJSON *ack = cJSON_CreateObject();
                 cJSON_AddStringToObject(ack, "cmd", CMD_HOST_ACK);
                 cJSON_AddStringToObject(ack, "status", "fail");
@@ -309,12 +463,29 @@ void HostTcpServer::HandlePending(PendingConn &pc, uint64_t now_ms)
                 cJSON_Delete(ack);
                 LOG_W("HOST", "设备 %s 的 proto_ver=%d 不受支持，已拒绝",
                       id->valuestring, pv->valueint);
+                FlushTx(); /* 尽力发送 fail ack 后再关闭 */
+                send_ctx_.erase(pc.sock);
                 net_sock_close(net_, pc.sock);
                 pc.sock = nullptr;
                 cJSON_Delete(json);
                 break;
             }
-            /* 注册处理：离线同 ID 可恢复；在线同 ID 已在 accept 阶段按 busy 拒绝 */
+            HostSerialProfile profile;
+            if (!ParseSerialProfile(json, &profile)) {
+                cJSON *ack = cJSON_CreateObject();
+                cJSON_AddStringToObject(ack, "cmd", CMD_HOST_ACK);
+                cJSON_AddStringToObject(ack, "status", "fail");
+                cJSON_AddStringToObject(ack, "reason", "invalid_serial_profile");
+                SendFrame(pc.sock, ack);
+                cJSON_Delete(ack);
+                LOG_W("HOST", "设备 %s 的 serial_profile 非法，已拒绝", id->valuestring);
+                FlushTx(); /* 尽力发送 fail ack 后再关闭 */
+                send_ctx_.erase(pc.sock);
+                net_sock_close(net_, pc.sock);
+                pc.sock = nullptr;
+                cJSON_Delete(json);
+                break;
+            }
             DeviceEntry *old = reg_.Find(id->valuestring);
             bool was_offline = old && old->state == "offline";
             bool resumed = false;
@@ -323,17 +494,9 @@ void HostTcpServer::HandlePending(PendingConn &pc, uint64_t now_ms)
             e->proto_ver = pv->valueint;
             if (was_offline) {
                 e->reconnect_count = old->reconnect_count + 1;
-                LOG_I("HOST", "注册：进入会话恢复路径，旧重连次数=%d，新重连次数=%d，session_id=%s",
-                      old->reconnect_count, e->reconnect_count,
-                      cJSON_IsString(sid) ? sid->valuestring : "（无）");
                 if (cJSON_IsString(sid) && !old->session_id.empty() &&
-                    strcmp(sid->valuestring, old->session_id.c_str()) == 0) {
-                    LOG_I("HOST", "会话已恢复：%s", id->valuestring);
+                    strcmp(sid->valuestring, old->session_id.c_str()) == 0)
                     resumed = true;
-                }
-            } else {
-                LOG_I("HOST", "注册：进入新会话路径，旧状态=%s",
-                      old ? old->state.c_str() : "（无）");
             }
             if (!resumed || e->session_id.empty())
                 e->session_id = NewSessionId();
@@ -344,7 +507,7 @@ void HostTcpServer::HandlePending(PendingConn &pc, uint64_t now_ms)
             cJSON_AddStringToObject(ack, "status", "ok");
             cJSON_AddNumberToObject(ack, "heartbeat_interval", params_.heartbeat_interval_ms / 1000);
             cJSON_AddStringToObject(ack, "session_id", e->session_id.c_str());
-            cJSON_AddNumberToObject(ack, "proto_ver", PROTO_VERSION);
+            cJSON_AddNumberToObject(ack, "proto_ver", PROTO_WIRE_VERSION);
             SendFrame(pc.sock, ack);
             cJSON_Delete(ack);
             LOG_I("HOST", "设备注册成功：%s，peer=%s，session_id=%s%s", id->valuestring,
@@ -352,6 +515,8 @@ void HostTcpServer::HandlePending(PendingConn &pc, uint64_t now_ms)
                   resumed ? "（已恢复）" : "");
             e->conn = pc.sock; /* 从 pending 转入 registry */
             pc.sock = nullptr;
+            if (sink_)
+                sink_->OnSessionOnline(id->valuestring, e->session_id, profile);
             {
                 char data[128];
                 snprintf(data, sizeof(data), "{\"peer\":\"%s\",\"reconnect_count\":%d}",
@@ -368,7 +533,6 @@ void HostTcpServer::HandlePending(PendingConn &pc, uint64_t now_ms)
             cJSON_Delete(json);
             break;
         }
-        /* 未知命令（协议文档 10.2 前向兼容） */
         if (name) {
             LOG_D("HOST", "待注册连接收到未知命令 %s（已忽略）", name);
         }
@@ -386,8 +550,11 @@ void HostTcpServer::HandleOnline(DeviceEntry &e, uint64_t now_ms)
         LOG_W("HOST", "设备连接已断开：%s（接收返回=%d）", e.id.c_str(), n);
         net_sock_close(net_, e.conn);
         conn_rx_.erase(e.conn);
+        send_ctx_.erase(e.conn);
         e.conn = nullptr;
         reg_.MarkOffline(e.id);
+        if (sink_)
+            sink_->OnSessionOffline(e.id, e.session_id, "conn_lost");
         pc_event_t ev;
         memset(&ev, 0, sizeof(ev));
         ev.event = "session_offline";
@@ -402,17 +569,29 @@ void HostTcpServer::HandleOnline(DeviceEntry &e, uint64_t now_ms)
     std::vector<uint8_t> &rx = conn_rx_[e.conn];
     rx.insert(rx.end(), buf, buf + n);
     while (!rx.empty()) {
-        cJSON *json = nullptr;
-        int rc = parse_frames(rx, &json);
+        ParsedFrame frame;
+        int rc = parse_v2_frames(rx, &frame);
         if (rc == 0)
             break;
-        if (rc == DEMO_ERR) {
+        if (rc < 0) {
             LOG_W("HOST", "在线连接收到畸形帧，已丢弃");
+            continue;
+        }
+        reg_.OnRx(e.id, now_ms);
+        if (frame.type == PROTO_V2_TYPE_SERIAL_BYTES) {
+            if (sink_)
+                sink_->OnSerialBytes(e.id, e.session_id, frame.payload.data(),
+                                     frame.payload.size(), now_ms);
+            continue;
+        }
+        cJSON *json = cJSON_ParseWithLength((const char *)frame.payload.data(),
+                                            frame.payload.size());
+        if (json == nullptr) {
+            LOG_W("HOST", "在线控制帧 JSON 解析失败");
             continue;
         }
         const cJSON *cmd = cJSON_GetObjectItemCaseSensitive(json, "cmd");
         const char *name = cmd && cJSON_IsString(cmd) ? cmd->valuestring : nullptr;
-        reg_.OnRx(e.id, now_ms);
         if (name && strcmp(name, CMD_PING) == 0) {
             const cJSON *seq = cJSON_GetObjectItemCaseSensitive(json, "seq");
             if (cJSON_IsNumber(seq)) {
@@ -455,8 +634,7 @@ void HostTcpServer::HandleOnline(DeviceEntry &e, uint64_t now_ms)
             if (cJSON_IsString(text)) {
                 LOG_I("HOST", "收到来自 %s 的调试消息：%s", e.id.c_str(), text->valuestring);
                 emit_app_data_event("app_data_rx", e.id.c_str(), text->valuestring);
-            } else
-                LOG_I("HOST", "收到来自 %s 的 app_data 占位消息（无 text 字段）", e.id.c_str());
+            }
         } else if (name) {
             LOG_D("HOST", "在线连接收到未知命令：%s", name);
         }
