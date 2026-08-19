@@ -143,13 +143,20 @@ target_include_directories(provision_pc PRIVATE
 )
 target_link_libraries(provision_pc PRIVATE pc_ui pc_core pc_sim_backend pc_common Qt6::Widgets)
 if(WIN32)
-    target_link_libraries(provision_pc PRIVATE pc_win_backend ws2_32)
+    target_link_libraries(provision_pc PRIVATE pc_win_backend ws2_32 shell32 advapi32)
 else()
     find_package(Threads REQUIRED)
     target_link_libraries(provision_pc PRIVATE Threads::Threads)
 endif()
 pc_enable_warnings(provision_pc)
 pc_set_output_dirs(provision_pc)
+
+# 构建后将默认配置复制到可执行目录，避免运行时"配置文件缺失"警告
+add_custom_command(TARGET provision_pc POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:provision_pc>/config"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/config/pc_config.json"
+            "$<TARGET_FILE_DIR:provision_pc>/config/pc_config.json")
 
 # ---------------- 协议产物与安装 ----------------
 include(GNUInstallDirs)

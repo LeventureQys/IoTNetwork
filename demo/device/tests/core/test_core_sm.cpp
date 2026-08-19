@@ -260,6 +260,19 @@ TEST(CoreSm, HeartbeatTimeoutHeals)
     f.Stop();
 }
 
+TEST(CoreSm, PeerCloseImmediatelyLeavesSession)
+{
+    fake_backend_reset();
+    fake_backend_set_ack_ok(1);
+    SmFixture f;
+    f.Start("sm_peerclose", "02:00:00:00:00:0C");
+    ASSERT_TRUE(f.WaitFor(AckOkPred, f.app, 5000));
+    fake_backend_set_recv_closed(1);
+    EXPECT_TRUE(f.WaitState(DEV_STATE_HEAL, 1000));
+    EXPECT_EQ(f.app->sess_sock, nullptr);
+    f.Stop();
+}
+
 TEST(CoreSm, TxTextValidatesBoundary)
 {
     fake_backend_reset();

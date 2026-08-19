@@ -23,6 +23,7 @@ void fake_backend_set_tcp_fail(int on);     /* tcp_connect 返回 DEMO_ERR */
 void fake_backend_set_wifi_drop(int on);    /* get_ip 失败 + current_ssid 空（WiFi 失效） */
 void fake_backend_set_ack_ok(int on);       /* sock_recv 返回一次 host_ack ok */
 void fake_backend_set_ack_busy(int on);     /* sock_recv 返回一次 host_ack busy */
+void fake_backend_set_recv_closed(int on);  /* sock_recv 返回连接关闭错误 */
 
 int  fake_backend_sta_connected(void);
 int  fake_backend_sta_disconnect_calls(void);

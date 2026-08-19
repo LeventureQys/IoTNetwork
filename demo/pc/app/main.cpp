@@ -18,10 +18,12 @@
 #include <cstring>
 #include <filesystem>
 #include <ctime>
+#include <string>
 #include <thread>
 
 #ifdef _WIN32
 #include <windows.h>
+#include <shellapi.h>
 #include <process.h>
 #define getpid _getpid
 #else
@@ -133,6 +135,78 @@ void emit_error(const char *operation, const char *message)
     LOG_E("MAIN", "%s：%s", operation, message);
 }
 
+#ifdef _WIN32
+/* Windows 真实热点后端需要管理员权限（固定 IP 改写/可靠启停热点）。
+ * 非提权时以 runas 重新启动自身，父进程等待子进程退出并透传退出码。 */
+bool process_is_elevated()
+{
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        return false;
+    TOKEN_ELEVATION elevation{};
+    DWORD size = 0;
+    const bool ok = GetTokenInformation(token, TokenElevation, &elevation,
+                                        sizeof(elevation), &size) &&
+                    size == sizeof(elevation);
+    CloseHandle(token);
+    return ok && elevation.TokenIsElevated != 0;
+}
+
+int relaunch_elevated(int argc, char **argv)
+{
+    std::string command_line;
+    for (int i = 1; i < argc; ++i) {
+        if (i > 1)
+            command_line += ' ';
+        const std::string arg = argv[i];
+        const bool needs_quote =
+            arg.empty() || arg.find_first_of(" \t\"") != std::string::npos;
+        if (!needs_quote) {
+            command_line += arg;
+            continue;
+        }
+        command_line += '"';
+        for (char c : arg) {
+            if (c == '"')
+                command_line += "\\\"";
+            else
+                command_line += c;
+        }
+        command_line += '"';
+    }
+    char exe_path[MAX_PATH] = {};
+    if (GetModuleFileNameA(nullptr, exe_path, MAX_PATH) == 0)
+        strncpy(exe_path, argv[0], MAX_PATH - 1);
+
+    SHELLEXECUTEINFOA info{};
+    info.cbSize = sizeof(info);
+    info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    info.lpVerb = "runas";
+    info.lpFile = exe_path;
+    info.lpParameters = command_line.empty() ? nullptr : command_line.c_str();
+    info.nShow = SW_SHOWNORMAL;
+    if (!ShellExecuteExA(&info)) {
+        const DWORD rc = GetLastError();
+        if (rc == ERROR_CANCELLED) {
+            fprintf(stderr, "已取消管理员授权；Windows 真实热点后端需要管理员权限。\n");
+        } else {
+            fprintf(stderr,
+                    "请求管理员权限失败（错误码 %lu）；Windows 真实热点后端需要以管理员身份运行。\n",
+                    (unsigned long)rc);
+        }
+        return 2;
+    }
+    if (info.hProcess) {
+        WaitForSingleObject(info.hProcess, INFINITE);
+        DWORD exit_code = 0;
+        GetExitCodeProcess(info.hProcess, &exit_code);
+        CloseHandle(info.hProcess);
+        return (int)exit_code;
+    }
+    return 2;
+}
+#endif
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -160,6 +234,13 @@ int main(int argc, char **argv)
         fprintf(stderr, "警告：Linux 下真实 WiFi 后端不可用，已回退到模拟模式（--sim）\n");
         backend_kind = 0;
     }
+#endif
+
+#ifdef _WIN32
+    /* Windows 真实热点后端需要管理员权限；非提权时自动请求 UAC 并透传子进程退出码。
+     * sim 后端不要求提权。 */
+    if (backend_kind == 1 && !process_is_elevated())
+        return relaunch_elevated(argc, argv);
 #endif
 
     /* CLI 相对路径按启动 CWD 规范化为绝对路径 */

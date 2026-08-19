@@ -146,8 +146,13 @@ int b_tcp_accept(void *user, void *listen, void **conn, net_addr_t *peer)
     sockaddr_in from;
     socket_length_t fromlen = sizeof(from);
     SOCKET c = accept(ls, (sockaddr *)&from, &fromlen);
-    if (c == INVALID_SOCKET)
-        return DEMO_ERR_AGAIN;
+    if (c == INVALID_SOCKET) {
+        int error = socket_last_error();
+        if (socket_would_block(error))
+            return DEMO_ERR_AGAIN;
+        LOG_W("SOCK", "TCP accept 失败，socket_error=%d", error);
+        return DEMO_ERR;
+    }
     set_nonblock(c);
     if (peer) {
         peer->ip = from.sin_addr.s_addr;
@@ -212,6 +217,7 @@ int b_sock_send(void *user, void *sock, const uint8_t *buf, int len)
         int err = socket_last_error();
         if (socket_would_block(err))
             return DEMO_ERR_AGAIN;
+        LOG_W("SOCK", "TCP send 失败，socket_error=%d", err);
         return DEMO_ERR;
     }
     if (n == 0)
@@ -228,10 +234,13 @@ int b_sock_recv(void *user, void *sock, uint8_t *buf, int cap)
         int err = socket_last_error();
         if (socket_would_block(err))
             return DEMO_ERR_AGAIN;
+        LOG_W("SOCK", "TCP recv 失败，socket_error=%d", err);
         return DEMO_ERR;
     }
-    if (n == 0)
-        return DEMO_ERR; /* 对端关闭 */
+    if (n == 0) {
+        LOG_I("SOCK", "TCP 对端已正常关闭连接");
+        return DEMO_ERR;
+    }
     return n;
 }
 

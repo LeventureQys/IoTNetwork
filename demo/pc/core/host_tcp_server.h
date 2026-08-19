@@ -30,6 +30,7 @@ public:
 private:
     struct PendingConn {
         void *sock = nullptr;
+        net_addr_t peer{};
         uint64_t connect_ms = 0;
         std::vector<uint8_t> rx;
         int malformed = 0;

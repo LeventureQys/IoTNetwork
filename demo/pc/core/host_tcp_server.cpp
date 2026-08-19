@@ -12,6 +12,21 @@
 #include <ctime>
 #include <random>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#else
+#include <arpa/inet.h>
+#endif
+
+static std::string peer_text(const net_addr_t &peer)
+{
+    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&peer.ip);
+    char text[32];
+    snprintf(text, sizeof(text), "%u.%u.%u.%u:%u", bytes[0], bytes[1], bytes[2], bytes[3],
+             static_cast<unsigned>(ntohs(peer.port)));
+    return text;
+}
+
 static void emit_app_data_event(const char *event, const char *device_id, const char *text)
 {
     char digest[65];
@@ -138,19 +153,24 @@ void HostTcpServer::Poll(uint64_t now_ms)
     /* accept 新连接（固定一对一：在线 + pending 总数 ≤ 1） */
     while (true) {
         void *conn = nullptr;
-        int rc = net_tcp_accept(net_, listen_, &conn, nullptr);
+        net_addr_t peer{};
+        int rc = net_tcp_accept(net_, listen_, &conn, &peer);
         if (rc == DEMO_ERR_AGAIN)
             break;
         if (rc != DEMO_OK)
             break;
+        std::string peer_name = peer_text(peer);
         if (ActiveConnCount() >= PROTO_HOST_MAX_CONN) {
+            LOG_W("HOST", "检测到并发连接：peer=%s，当前连接数=%d", peer_name.c_str(),
+                  ActiveConnCount());
             RejectBusy(conn);
         } else {
             PendingConn pc;
             pc.sock = conn;
+            pc.peer = peer;
             pc.connect_ms = now_ms;
             pending_.push_back(pc);
-            LOG_I("HOST", "已接受连接，等待 device_hello");
+            LOG_I("HOST", "已接受连接：peer=%s，等待 device_hello", peer_name.c_str());
         }
     }
 
@@ -327,8 +347,9 @@ void HostTcpServer::HandlePending(PendingConn &pc, uint64_t now_ms)
             cJSON_AddNumberToObject(ack, "proto_ver", PROTO_VERSION);
             SendFrame(pc.sock, ack);
             cJSON_Delete(ack);
-            LOG_I("HOST", "设备注册成功：%s，session_id=%s%s", id->valuestring,
-                  e->session_id.c_str(), resumed ? "（已恢复）" : "");
+            LOG_I("HOST", "设备注册成功：%s，peer=%s，session_id=%s%s", id->valuestring,
+                  peer_text(pc.peer).c_str(), e->session_id.c_str(),
+                  resumed ? "（已恢复）" : "");
             e->conn = pc.sock; /* 从 pending 转入 registry */
             pc.sock = nullptr;
             {

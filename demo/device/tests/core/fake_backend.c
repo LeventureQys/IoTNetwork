@@ -45,6 +45,7 @@ static struct fake_globals {
     int ack_ok;
     int ack_busy;
     int ack_sent;
+    int recv_closed;
     int sta_connected;
     int sta_disconnect_calls;
     int deinit_calls;
@@ -72,6 +73,7 @@ void fake_backend_set_tcp_fail(int on) { g.tcp_fail = on; }
 void fake_backend_set_wifi_drop(int on) { g.wifi_drop = on; }
 void fake_backend_set_ack_ok(int on) { g.ack_ok = on; }
 void fake_backend_set_ack_busy(int on) { g.ack_busy = on; }
+void fake_backend_set_recv_closed(int on) { g.recv_closed = on; }
 
 int fake_backend_sta_connected(void) { return g.sta_connected; }
 int fake_backend_sta_disconnect_calls(void) { return g.sta_disconnect_calls; }
@@ -361,6 +363,8 @@ static int fb_sock_recv(void *user, void *sock, uint8_t *buf, int cap)
         fake_sleep_ms(g.slow_recv_ms);
     if (buf == NULL || cap <= 0)
         return DEMO_ERR_INVAL;
+    if (g.recv_closed)
+        return DEMO_ERR;
 
     /* 一次性下发 host_ack（ok 或 busy），随后无数据（供心跳超时用例） */
     if (!g.ack_sent && (g.ack_ok || g.ack_busy)) {

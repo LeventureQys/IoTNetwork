@@ -248,7 +248,8 @@ void device_app_handle_rx(device_app_t *app, void *sock)
     if (n == DEMO_ERR_AGAIN)
         return;
     if (n < 0) {
-        /* 连接关闭：通知会话层（由状态机处理） */
+        /* 连接关闭或读取失败：通知会话层（由状态机处理）。 */
+        LOG_W(app->device_id, "会话：接收失败（rc=%d）", n);
         app->rx_len = 0; /* 清残留帧缓冲 */
         app->rx_sock = sock;
         session_on_conn_closed(app);

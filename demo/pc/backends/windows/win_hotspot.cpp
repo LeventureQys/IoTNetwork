@@ -39,6 +39,26 @@ std::string hresult_message(hresult_error const &e)
     return "HRESULT 0x" + std::to_string((unsigned long)(int32_t)e.code());
 }
 
+/* TetheringOperationStatus 枚举值（SDK windows.networking.networkoperators.0.h）的中文/英文名。 */
+const char *tethering_status_name(TetheringOperationStatus status)
+{
+    switch (status) {
+    case TetheringOperationStatus::Success: return "Success";
+    case TetheringOperationStatus::Unknown: return "Unknown";
+    case TetheringOperationStatus::MobileBroadbandDeviceOff: return "MobileBroadbandDeviceOff";
+    case TetheringOperationStatus::WiFiDeviceOff: return "WiFiDeviceOff";
+    case TetheringOperationStatus::EntitlementCheckTimeout: return "EntitlementCheckTimeout";
+    case TetheringOperationStatus::EntitlementCheckFailure: return "EntitlementCheckFailure";
+    case TetheringOperationStatus::OperationInProgress: return "OperationInProgress";
+    case TetheringOperationStatus::BluetoothDeviceOff: return "BluetoothDeviceOff";
+    case TetheringOperationStatus::NetworkLimitedConnectivity: return "NetworkLimitedConnectivity";
+    case TetheringOperationStatus::AlreadyOn: return "AlreadyOn";
+    case TetheringOperationStatus::RadioRestriction: return "RadioRestriction";
+    case TetheringOperationStatus::BandInterference: return "BandInterference";
+    }
+    return "UnknownStatus";
+}
+
 /* 找到可承载热点的 Wi-Fi 连接配置；无 Wi-Fi 时回退到任意带适配器的配置。 */
 ConnectionProfile find_wifi_profile()
 {
@@ -57,7 +77,9 @@ ConnectionProfile find_wifi_profile()
 }
 
 /* 定位 Windows 移动热点承载适配器（Microsoft Wi-Fi Direct Virtual Adapter 或
- * 持有 192.168.137.x 的适配器），仅读取 IPv4/前缀，绝不修改其他网卡。 */
+ * 持有 192.168.137.x 的适配器），仅读取 IPv4/前缀，绝不修改其他网卡。
+ * 优先级：已持有 192.168.137.x 的 Up 适配器 > Up 的 Wi-Fi Direct 虚拟适配器（非 APIPA）
+ * > Up 的 Wi-Fi Direct 虚拟适配器（任意地址）。后者用于 ICS 尚未完成地址分配时的暂态。 */
 struct HotspotAdapterInfo {
     bool found = false;
     NET_IFINDEX ifindex = 0;
@@ -68,6 +90,10 @@ struct HotspotAdapterInfo {
 HotspotAdapterInfo query_hotspot_adapter()
 {
     HotspotAdapterInfo info;
+    HotspotAdapterInfo virtual_ok;  /* 虚拟适配器，非 APIPA 地址 */
+    HotspotAdapterInfo virtual_any; /* 虚拟适配器，任意 IPv4（含 APIPA 暂态） */
+    bool have_virtual_ok = false;
+    bool have_virtual_any = false;
     const ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
                         GAA_FLAG_SKIP_DNS_SERVER;
     ULONG size = 0;
@@ -92,16 +118,35 @@ HotspotAdapterInfo query_hotspot_adapter()
             char buffer[INET_ADDRSTRLEN] = {};
             if (!inet_ntop(AF_INET, &sin->sin_addr, buffer, sizeof(buffer)))
                 continue;
-            if (is_virtual || strncmp(buffer, "192.168.137.", 12) == 0) {
+            /* 第一优先：已持有 ICS 目标网段（192.168.137.x）的 Up 适配器 */
+            if (strncmp(buffer, "192.168.137.", 12) == 0) {
                 info.found = true;
                 info.ifindex = adapter->IfIndex;
                 info.ipv4 = buffer;
                 info.prefix = (int)address->OnLinkPrefixLength;
                 return info;
             }
+            if (!is_virtual)
+                continue;
+            const bool apipa = strncmp(buffer, "169.254.", 8) == 0;
+            if (!apipa && !have_virtual_ok) {
+                virtual_ok.found = true;
+                virtual_ok.ifindex = adapter->IfIndex;
+                virtual_ok.ipv4 = buffer;
+                virtual_ok.prefix = (int)address->OnLinkPrefixLength;
+                have_virtual_ok = true;
+            } else if (apipa && !have_virtual_any) {
+                virtual_any.found = true;
+                virtual_any.ifindex = adapter->IfIndex;
+                virtual_any.ipv4 = buffer;
+                virtual_any.prefix = (int)address->OnLinkPrefixLength;
+                have_virtual_any = true;
+            }
         }
     }
-    return info;
+    if (have_virtual_ok)
+        return virtual_ok;
+    return virtual_any;
 }
 
 bool valid_ipv4_text(const char *ipv4)
@@ -185,8 +230,18 @@ int real_start(void *ctx, const char *ssid, const char *password, std::string *e
         manager.ConfigureAccessPointAsync(config).get();
 
         NetworkOperatorTetheringOperationResult result = manager.StartTetheringAsync().get();
-        if (result.Status() != TetheringOperationStatus::Success) {
-            if (error) *error = "启动移动热点失败（系统返回非成功状态）";
+        const TetheringOperationStatus start_status = result.Status();
+        if (start_status != TetheringOperationStatus::Success &&
+            start_status != TetheringOperationStatus::AlreadyOn) {
+            if (error) {
+                std::string reason = "启动移动热点失败：系统返回 " +
+                                     std::string(tethering_status_name(start_status));
+                if (start_status == TetheringOperationStatus::Unknown)
+                    reason += "（热点服务可能卡死，请重启 Windows 移动热点服务或重启系统后重试）";
+                *error = reason;
+            }
+            LOG_E("HOTSPOT", "移动热点启动失败，SSID=%s，状态=%s", ssid,
+                  tethering_status_name(start_status));
             return DEMO_ERR;
         }
 
@@ -289,6 +344,25 @@ int real_configure_ipv4(void *ctx, const char *ipv4, int prefix_length, std::str
         LOG_I("HOTSPOT", "热点承载适配器 IPv4 已为目标值 %s/%d", ipv4, prefix_length);
         return DEMO_OK;
     }
+    /* ICS 在热点启动后会自动分配承载网段（默认 192.168.137.1/24）。
+     * 若当前是 APIPA（169.254.x，Windows 自分配地址），说明 ICS 尚未完成配置；
+     * 先等待其收敛，避免与系统地址管理竞争（也避免刚启动即强制停止热点）。 */
+    if (info.ipv4.rfind("169.254.", 0) == 0) {
+        for (int attempt = 0; attempt < 24; ++attempt) { /* 24 * 500ms = 12 秒 */
+            Sleep(500);
+            HotspotAdapterInfo latest = query_hotspot_adapter();
+            if (latest.found) {
+                if (latest.ipv4 == ipv4 && latest.prefix == prefix_length) {
+                    LOG_I("HOTSPOT", "ICS 已将热点承载适配器配置为目标值 %s/%d",
+                          ipv4, prefix_length);
+                    return DEMO_OK;
+                }
+                info = latest; /* 用最新快照继续后续强制配置 */
+            }
+        }
+        LOG_W("HOTSPOT", "等待 ICS 配置 %s/%d 超时，尝试强制设置（需要管理员权限）",
+              ipv4, prefix_length);
+    }
     /* 仅对目标热点承载适配器设置静态地址；失败即 fail-closed。 */
     MIB_UNICASTIPADDRESS_ROW row;
     InitializeUnicastIpAddressEntry(&row);
@@ -300,7 +374,11 @@ int real_configure_ipv4(void *ctx, const char *ipv4, int prefix_length, std::str
     row.PreferredLifetime = 0xffffffff;
     DWORD rc = SetUnicastIpAddressEntry(&row);
     if (rc != NO_ERROR) {
-        if (error) *error = "设置热点承载适配器 IPv4 失败（错误码 " + std::to_string(rc) + "）";
+        std::string reason =
+            "设置热点承载适配器 IPv4 失败（错误码 " + std::to_string(rc) + "）";
+        if (rc == ERROR_ACCESS_DENIED)
+            reason += "：缺少管理员权限，请以管理员身份运行";
+        if (error) *error = reason;
         LOG_E("HOTSPOT", "设置热点适配器 IPv4 失败，错误码=%lu", (unsigned long)rc);
         return DEMO_ERR;
     }
@@ -317,7 +395,28 @@ int real_stop(void *ctx, std::string *error)
         return DEMO_OK; /* 幂等 */
     }
     try {
-        impl->manager.StopTetheringAsync().get();
+        NetworkOperatorTetheringOperationResult result = impl->manager.StopTetheringAsync().get();
+        if (result.Status() != TetheringOperationStatus::Success) {
+            if (error) *error = "停止移动热点失败：系统返回 " +
+                                std::string(tethering_status_name(result.Status()));
+            LOG_E("HOTSPOT", "停止移动热点失败：%s",
+                  tethering_status_name(result.Status()));
+            return DEMO_ERR;
+        }
+        /* 确认状态真正变为 Off，避免残留热点（返回值可能为假成功） */
+        bool off = false;
+        for (int i = 0; i < 20; ++i) { /* 最多 5 秒 */
+            if (impl->manager.TetheringOperationalState() == TetheringOperationalState::Off) {
+                off = true;
+                break;
+            }
+            Sleep(250);
+        }
+        if (!off) {
+            if (error) *error = "停止移动热点超时：状态未在 5 秒内变为 Off";
+            LOG_W("HOTSPOT", "停止移动热点后状态未在 5 秒内变为 Off");
+            return DEMO_ERR_TIMEOUT;
+        }
     } catch (const hresult_error &e) {
         if (error) *error = "停止移动热点失败：" + hresult_message(e);
         return DEMO_ERR;

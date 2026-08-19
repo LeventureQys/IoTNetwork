@@ -58,12 +58,12 @@ static void session_publish_online(device_app_t *app)
     device_app_publish_event(app, "session_online", "ok", 0, data);
 }
 
-static void session_send_ping(device_app_t *app)
+static int session_send_ping(device_app_t *app)
 {
     if (app->sess_sock == NULL)
-        return;
+        return 0;
     if (!limits_allow_send(app, 1))
-        return;
+        return 1;
     cJSON *ping = cJSON_CreateObject();
     cJSON_AddStringToObject(ping, "cmd", CMD_PING);
     cJSON_AddNumberToObject(ping, "seq", (int)++app->ping_seq);
@@ -73,8 +73,12 @@ static void session_send_ping(device_app_t *app)
         snprintf(data, sizeof(data), "{\"direction\":\"tx\",\"sequence\":%d}",
                  (int)app->ping_seq);
         device_app_publish_event(app, "ping", "ok", 0, data);
+    } else {
+        LOG_W(app->device_id, "会话：ping 发送失败（rc=%d），关闭连接", rc);
+        session_disconnect(app);
     }
     cJSON_Delete(ping);
+    return rc == DEMO_OK;
 }
 
 int session_poll(device_app_t *app)
@@ -85,12 +89,15 @@ int session_poll(device_app_t *app)
     }
     uint64_t now = net_time_ms(app->net);
 
-    /* 收包 */
+    /* 收包：对端关闭或读取失败会将 sess_sock 清空，必须立即退出本轮。 */
     device_app_handle_rx(app, app->sess_sock);
+    if (app->sess_sock == NULL)
+        return 0;
 
     /* 心跳 */
     if (app->last_ping_ms == 0 || now - app->last_ping_ms >= (uint64_t)app->heartbeat_interval_ms) {
-        session_send_ping(app);
+        if (!session_send_ping(app))
+            return 0;
         app->last_ping_ms = net_time_ms(app->net);
     }
 
