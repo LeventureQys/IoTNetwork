@@ -86,8 +86,9 @@ struct device_app {
     int evlog_count;
     uint64_t last_evlog_nvs_ms;    /* NVS 写入防抖 */
 
-    /* 帧接收缓冲（业务连接） */
-    uint8_t rx_buf[PROTO_MSG_MAX_LEN + PROTO_FRAME_HEAD_LEN + 1];
+    /* 帧接收缓冲（业务连接，wire v2：容纳最大 SERIAL_BYTES chunk 一帧） */
+    uint8_t rx_buf[PROTO_V2_SERIAL_CHUNK_MAX + PROTO_V2_HEAD_LEN +
+                   PROTO_V2_BODY_HEAD_LEN + 1];
     int rx_len;
     void *rx_sock;
 

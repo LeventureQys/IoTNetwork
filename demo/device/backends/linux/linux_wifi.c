@@ -307,8 +307,10 @@ int linux_wifi_scan(linux_wifi_t *wifi, net_ap_info_t *aps, int *count)
         return DEMO_ERR;
     LOG_D(TAG, "扫描 WiFi 网络...");
     outbuf[0] = '\0';
-    if (exec_capture(wifi, argv, outbuf, sizeof(outbuf)) != 0 || outbuf[0] == '\0')
+    if (exec_capture(wifi, argv, outbuf, sizeof(outbuf)) != 0 || outbuf[0] == '\0') {
+        LOG_W(TAG, "nmcli 扫描命令执行失败或无输出（iface=%s）", wifi->sta_iface);
         return DEMO_ERR;
+    }
 
     n = 0;
     cap = *count;

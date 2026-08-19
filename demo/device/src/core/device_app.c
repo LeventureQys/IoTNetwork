@@ -352,6 +352,16 @@ static int device_app_flush_tx(device_app_t *app)
 
 /* ---------------- 收包统一入口（仅业务会话） ---------------- */
 
+static void rx_close_malformed(device_app_t *app, void *sock)
+{
+    LOG_W(app->device_id, "畸形报文过多，关闭连接");
+    net_sock_close(app->net, sock);
+    app->rx_len = 0;
+    app->sess_sock = NULL;
+    session_on_conn_closed(app);
+    app->rx_sock = NULL;
+}
+
 void device_app_handle_rx(device_app_t *app, void *sock)
 {
     uint8_t buf[512];
@@ -374,62 +384,80 @@ void device_app_handle_rx(device_app_t *app, void *sock)
         app->rx_len = 0; /* 溢出：丢弃缓冲（防呆） */
         app->malformed_count++;
         if (app->malformed_count >= app->params->malformed_max_per_conn) {
-            LOG_W(app->device_id, "畸形报文过多，关闭连接");
-            net_sock_close(app->net, sock);
-            app->sess_sock = NULL;
-            session_on_conn_closed(app);
-            app->rx_sock = NULL;
+            rx_close_malformed(app, sock);
             return;
         }
     }
     memcpy(app->rx_buf + app->rx_len, buf, (size_t)n);
     app->rx_len += n;
 
-    /* 帧解析循环 */
-    int consumed = 0;
-    int off = 0, len = 0;
+    /* wire v2 帧解析循环 */
     while (app->rx_len > 0) {
-        int rc = frame_parse(app->rx_buf, app->rx_len, &off, &len, &consumed);
+        int type = 0;
+        uint64_t sequence = 0;
+        const uint8_t *payload = NULL;
+        int payload_len = 0;
+        int consumed = 0;
+        int rc = frame_v2_parse(app->rx_buf, app->rx_len, &type, &sequence,
+                                &payload, &payload_len, &consumed);
         if (rc == 0)
             break; /* 需要更多数据 */
         if (rc == DEMO_ERR) {
             app->malformed_count++;
-            LOG_W(app->device_id, "收到畸形帧（%d/%d）", app->malformed_count,
-                  app->params->malformed_max_per_conn);
+            LOG_W(app->device_id, "收到畸形帧（%d/%d，丢弃 %d 字节重同步）",
+                  app->malformed_count, app->params->malformed_max_per_conn,
+                  consumed);
             if (app->malformed_count >= app->params->malformed_max_per_conn) {
-                LOG_W(app->device_id, "畸形报文过多，关闭连接");
-                net_sock_close(app->net, sock);
-                app->rx_len = 0;
-                app->sess_sock = NULL;
-                session_on_conn_closed(app);
-                app->rx_sock = NULL;
+                rx_close_malformed(app, sock);
                 return;
             }
             /* 丢弃畸形前缀，继续重同步 */
-            memmove(app->rx_buf, app->rx_buf + consumed, (size_t)(app->rx_len - consumed));
+            memmove(app->rx_buf, app->rx_buf + consumed,
+                    (size_t)(app->rx_len - consumed));
             app->rx_len -= consumed;
             continue;
         }
-        /* 完整帧 */
-        app->rx_buf[off + len] = '\0';
-        cJSON *json = cJSON_Parse((const char *)(app->rx_buf + off));
-        if (json == NULL) {
-            app->malformed_count++;
-            LOG_W(app->device_id, "JSON 解析失败");
-        } else {
-            const cJSON *cmd = cJSON_GetObjectItemCaseSensitive(json, "cmd");
-            const char *cmdname = (cmd && cJSON_IsString(cmd)) ? cmd->valuestring : NULL;
-            if (cmdname == NULL) {
+
+        if (type == PROTO_V2_TYPE_CONTROL_JSON) {
+            cJSON *json = cJSON_ParseWithLength((const char *)payload,
+                                                (size_t)payload_len);
+            if (json == NULL) {
                 app->malformed_count++;
-                LOG_W(app->device_id, "消息缺少 cmd 字段");
+                LOG_W(app->device_id, "控制帧 JSON 解析失败（%d/%d）",
+                      app->malformed_count, app->params->malformed_max_per_conn);
+                if (app->malformed_count >= app->params->malformed_max_per_conn) {
+                    rx_close_malformed(app, sock);
+                    return;
+                }
             } else {
-                LOG_I(app->device_id, "RX %s", cmdname);
-                session_on_msg(app, json);
+                const cJSON *cmd = cJSON_GetObjectItemCaseSensitive(json, "cmd");
+                const char *cmdname =
+                    (cmd && cJSON_IsString(cmd)) ? cmd->valuestring : NULL;
+                if (cmdname == NULL) {
+                    app->malformed_count++;
+                    LOG_W(app->device_id, "消息缺少 cmd 字段（%d/%d）",
+                          app->malformed_count,
+                          app->params->malformed_max_per_conn);
+                    if (app->malformed_count >=
+                        app->params->malformed_max_per_conn) {
+                        rx_close_malformed(app, sock);
+                        return;
+                    }
+                } else {
+                    LOG_I(app->device_id, "RX %s", cmdname);
+                    session_on_msg(app, json);
+                }
+                cJSON_Delete(json);
             }
-            cJSON_Delete(json);
+        } else {
+            /* SERIAL_BYTES：当前版本设备端无数据面消费者，仅刷新存活并丢弃 */
+            app->last_rx_ms = net_time_ms(app->net);
+            LOG_I(app->device_id, "收到 SERIAL_BYTES 帧（%d 字节，seq=%llu），无消费者，丢弃",
+                  payload_len, (unsigned long long)sequence);
         }
         /* 消费该帧 */
-        memmove(app->rx_buf, app->rx_buf + consumed, (size_t)(app->rx_len - consumed));
+        memmove(app->rx_buf, app->rx_buf + consumed,
+                (size_t)(app->rx_len - consumed));
         app->rx_len -= consumed;
     }
     app->rx_sock = NULL;
@@ -598,7 +626,11 @@ static void sm_wifi_scan(device_app_t *app)
     net_ap_info_t aps[DEVICE_SCAN_MAX_APS];
     int count = DEVICE_SCAN_MAX_APS;
     int found = -1;
-    if (net_wifi_scan(app->net, aps, &count) == DEMO_OK) {
+    int scan_rc = net_wifi_scan(app->net, aps, &count);
+    if (scan_rc != DEMO_OK) {
+        evlog_record(app, "WiFi 扫描命令失败（rc=%d），本轮无结果", scan_rc);
+        count = 0;
+    } else {
         for (int i = 0; i < count && i < DEVICE_SCAN_MAX_APS; i++) {
             if (aps[i].band_2g &&
                 strcmp(aps[i].ssid, app->params->pc_ap_ssid) == 0) {
@@ -620,6 +652,22 @@ static void sm_wifi_scan(device_app_t *app)
     }
 
     evlog_record(app, "未发现目标热点，继续扫描（第 %d 次）", app->wifi_retry_count + 1);
+    /* 诊断：本轮可见的全部网络，便于排查“热点未广播 / SSID 不匹配” */
+    char seen[512];
+    int off = 0;
+    seen[0] = '\0';
+    for (int i = 0; i < count && i < DEVICE_SCAN_MAX_APS; i++) {
+        int used = snprintf(seen + off, sizeof(seen) - (size_t)off,
+                            "%s%s(%d)", off > 0 ? " " : "", aps[i].ssid,
+                            aps[i].rssi);
+        if (used < 0 || (size_t)used >= sizeof(seen) - (size_t)off) {
+            snprintf(seen + off, sizeof(seen) - (size_t)off, " ...");
+            break;
+        }
+        off += used;
+    }
+    LOG_I(app->device_id, "诊断：本轮可见 %d 个网络：%s", count,
+          count > 0 ? seen : "（无）");
     app->wifi_retry_count++;
     app->state_enter_ms = now; /* 退避窗口起点 */
 }
