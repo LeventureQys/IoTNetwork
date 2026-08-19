@@ -1,5 +1,4 @@
 #include "win_backend.h"
-#include "win_hotspot.h"
 #include "pc_socket_backend.h"
 #include "log.h"
 
@@ -22,7 +21,6 @@ namespace {
 
 struct WinBackend {
     void *socket_user;
-    WinHotspot *hotspot = nullptr;
     HANDLE wlan = nullptr;
     DWORD wlan_version = 0;
     GUID connected_interface{};
@@ -297,57 +295,8 @@ void backend_deinit(void *user)
     }
 }
 
-int hotspot_ap_start(void *user, const char *ssid, const char *pass, const char *pin)
-{
-    (void)pin; /* 设计文档 7.1：PIN 参数必须忽略 */
-    WinBackend *backend = static_cast<WinBackend *>(user);
-    if (!backend->hotspot)
-        return DEMO_ERR;
-    std::string error;
-    int rc = backend->hotspot->Start(ssid, pass, &error);
-    if (rc != DEMO_OK)
-        LOG_E("WLAN", "移动热点启动失败，SSID=%s：%s", ssid ? ssid : "",
-              error.c_str());
-    return rc;
-}
-
-int hotspot_ap_stop(void *user)
-{
-    WinBackend *backend = static_cast<WinBackend *>(user);
-    if (!backend->hotspot)
-        return DEMO_OK; /* 无热点组件：幂等停止 */
-    std::string error;
-    int rc = backend->hotspot->Stop(&error);
-    if (rc != DEMO_OK)
-        LOG_W("WLAN", "移动热点停止失败：%s", error.c_str());
-    return rc;
-}
-
-int hotspot_ap_status(void *user, net_ap_status_t *status)
-{
-    WinBackend *backend = static_cast<WinBackend *>(user);
-    if (!backend->hotspot)
-        return DEMO_ERR;
-    std::string error;
-    int rc = backend->hotspot->Query(status, &error);
-    if (rc != DEMO_OK)
-        LOG_W("WLAN", "查询移动热点状态失败：%s", error.c_str());
-    return rc;
-}
-
-int hotspot_ap_configure_ipv4(void *user, const char *ipv4, int prefix_length)
-{
-    WinBackend *backend = static_cast<WinBackend *>(user);
-    if (!backend->hotspot)
-        return DEMO_ERR;
-    std::string error;
-    int rc = backend->hotspot->ConfigureIpv4(ipv4, prefix_length, &error);
-    if (rc != DEMO_OK)
-        LOG_E("WLAN", "配置热点承载适配器 IPv4=%s/%d 失败：%s",
-              ipv4 ? ipv4 : "", prefix_length, error.c_str());
-    return rc;
-}
-
+int unsupported_ap_start(void *, const char *, const char *, const char *) { return DEMO_ERR; }
+int unsupported_ap_stop(void *) { return DEMO_ERR; }
 int socket_wifi_rssi(void *, int *) { return DEMO_ERR; }
 int socket_wifi_ip(void *, uint32_t *ip)
 {
@@ -557,8 +506,7 @@ int unsupported_inject(void *, const char *, const char *) { return DEMO_ERR; }
 const net_backend_t backend_table = {
     backend_init, backend_deinit,
     wlan_scan, wlan_connect, wlan_disconnect,
-    hotspot_ap_start, hotspot_ap_stop, hotspot_ap_status, hotspot_ap_configure_ipv4,
-    socket_wifi_rssi, socket_wifi_ip,
+    unsupported_ap_start, unsupported_ap_stop, socket_wifi_rssi, socket_wifi_ip,
     wlan_get_current_ssid, wlan_get_gateway,
     socket_tcp_listen, socket_tcp_accept, socket_tcp_connect,
     socket_send, socket_recv, socket_close,
@@ -600,7 +548,6 @@ void *win_backend_create(const demo_params_t *params)
         delete backend;
         return nullptr;
     }
-    backend->hotspot = new WinHotspot();
     return backend;
 }
 
@@ -609,8 +556,6 @@ void win_backend_destroy(void *user)
     WinBackend *backend = static_cast<WinBackend *>(user);
     if (!backend)
         return;
-    delete backend->hotspot;
-    backend->hotspot = nullptr;
     pc_socket_backend_destroy(backend->socket_user);
     delete backend;
 }

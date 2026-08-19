@@ -17,14 +17,6 @@ typedef struct net_addr { uint32_t ip; uint16_t port; } net_addr_t;
 typedef struct net_ap_info { char ssid[33]; int rssi; int band_2g; char bssid[18]; } net_ap_info_t;
 typedef struct net_mdns_service { char instance[64]; char type[64]; net_addr_t addr; char txt[128]; } net_mdns_service_t;
 
-/* PC 主动热点状态（设计文档 7.1）：started=1 表示热点已运行。 */
-typedef struct net_ap_status {
-    int started;
-    char ssid[33];
-    char ipv4[16];
-    int prefix_length;
-} net_ap_status_t;
-
 /* 后端 vtable：所有函数由后端实现；便捷封装见下方 net_xxx 系列 */
 typedef struct net_backend {
     /* 生命周期 */
@@ -36,8 +28,6 @@ typedef struct net_backend {
     int  (*wifi_sta_disconnect)(void *user);
     int  (*wifi_ap_start)(void *user, const char *ssid, const char *pass, const char *pin);
     int  (*wifi_ap_stop)(void *user);
-    int  (*wifi_ap_status)(void *user, net_ap_status_t *status);                /* 热点未运行返回 DEMO_ERR */
-    int  (*wifi_ap_configure_ipv4)(void *user, const char *ipv4, int prefix_length);
     int  (*wifi_get_rssi)(void *user, int *rssi);                               /* dBm */
     int  (*wifi_get_ip)(void *user, uint32_t *ip);                              /* 当前 STA/AP 虚拟 IP，网络字节序 */
     int  (*wifi_get_current_ssid)(void *user, char *ssid, int capacity);         /* 当前 STA 实际关联 SSID */
@@ -84,8 +74,6 @@ int  net_wifi_sta_connect(net_ctx_t *c, const char *ssid, const char *pass, wifi
 int  net_wifi_sta_disconnect(net_ctx_t *c);
 int  net_wifi_ap_start(net_ctx_t *c, const char *ssid, const char *pass, const char *pin);
 int  net_wifi_ap_stop(net_ctx_t *c);
-int  net_wifi_ap_status(net_ctx_t *c, net_ap_status_t *status);
-int  net_wifi_ap_configure_ipv4(net_ctx_t *c, const char *ipv4, int prefix_length);
 int  net_wifi_get_rssi(net_ctx_t *c, int *rssi);
 int  net_wifi_get_ip(net_ctx_t *c, uint32_t *ip);
 int  net_wifi_get_current_ssid(net_ctx_t *c, char *ssid, int capacity);

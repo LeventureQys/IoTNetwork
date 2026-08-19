@@ -24,9 +24,8 @@ add_executable(pc_unit_tests
     test_sim_tcp_endpoint.cpp
     test_sim_socket.cpp
     test_host_app.cpp
-    test_host_session.cpp
-    test_win_hotspot.cpp
     test_events.cpp
+    test_wifi_result_reason.cpp
     test_scenario.cpp
     test_paths.cpp
     test_catalog.cpp
@@ -50,38 +49,4 @@ pc_set_output_dirs(pc_unit_tests)
 
 add_test(NAME pc_unit_tests
          COMMAND pc_unit_tests
-         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
-
-# SS2.2：PC UI 无旧配网文案 + 六节点流程图（独立目标，链接 pc_ui + Qt6::Widgets）。
-add_executable(pc_ui_tests
-    test_host_window_ui.cpp
-)
-target_include_directories(pc_ui_tests PRIVATE ${PC_TESTS_INCLUDE_DIRS})
-target_link_libraries(pc_ui_tests PRIVATE pc_ui gtest_main)
-pc_enable_warnings(pc_ui_tests)
-pc_set_output_dirs(pc_ui_tests)
-
-add_test(NAME pc_ui_tests
-         COMMAND pc_ui_tests
-         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
-# 无头运行 Qt：指定 offscreen 平台与插件目录（由 Qt6_DIR 推导 Qt 安装前缀）。
-get_filename_component(_qt_prefix "${Qt6_DIR}/../../.." ABSOLUTE)
-set_tests_properties(pc_ui_tests PROPERTIES
-    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_PLUGIN_PATH=${_qt_prefix}/plugins")
-
-# SS1.1：跨端契约冻结的配置/协议/contract 单元测试（独立目标，仅链接 pc_common）。
-add_executable(pc_contract_tests
-    test_protocol.cpp
-    test_params.cpp
-    test_contract.cpp
-)
-target_include_directories(pc_contract_tests PRIVATE ${PC_TESTS_INCLUDE_DIRS})
-target_compile_definitions(pc_contract_tests PRIVATE
-    PC_CONTRACT_GOLDEN="${CMAKE_CURRENT_SOURCE_DIR}/../../integration_tests/contracts/protocol-contract.golden.json")
-target_link_libraries(pc_contract_tests PRIVATE pc_common gtest_main)
-pc_enable_warnings(pc_contract_tests)
-pc_set_output_dirs(pc_contract_tests)
-
-add_test(NAME pc_contract_tests
-         COMMAND pc_contract_tests
          WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")

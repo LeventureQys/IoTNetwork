@@ -5,19 +5,14 @@
  * singleton；所有状态进入显式 sim_backend_t 实例；vtable 布局保持
  * net_abstraction.h 的 29 项不变。
  *
- * beta v1.1 角色反转（设计文档 7.3 / DQ6）：
- *   - 设备只作为 STA：扫描/连接/网关均来自 PC 发布的 catalog 记录；
- *     设备不再创建热点，wifi_ap_start/stop 返回 DEMO_ERR。
- *   - TCP 固定目标 192.168.137.1:5935 经 catalog 翻译到 127.0.0.1:<loopback_port>；
- *     其余地址不做该翻译。
- *
  * 公开契约（设计文档 8.2.1）：
  *   device_sim_backend_create(options, out_instance, error)
  *   - 进入时清零 out_instance；
  *   - 失败返回明确 device_result_t 且无部分实例；
  *   - 成功时 vtable/user/destroy_user 均非空；
  *   - options 字符串仅在调用期借用，内部复制。
- * 实例销毁（destroy_user）幂等：可接收 NULL。
+ * 实例销毁（destroy_user）幂等：可接收 NULL；AP 运行中先注销并删除
+ * catalog 正式文件与本进程 tmp。
  * ========================================================================== */
 #include "device_backend_factory.h"
 #include "sim_world.h"
@@ -43,15 +38,23 @@ typedef struct sim_backend {
 
     char tag[16];
     unsigned int device_index;
+    unsigned int provision_port;
+    int ap_started;
+    char ap_ssid[33];
 
     int sta_connected;
     char sta_ssid[33];
 
     char catalog_dir[1024];
     char nvs_file[1024];
+    char host_virtual_ip[16];
+    char target_ssid[33];
+    char target_password[64];
 
     int wsa_ready;
 } sim_backend_t;
+
+static const char *kDefaultHostVirtualIp = "192.168.1.50";
 
 static void sim_backend_set_error(device_error_t *error, device_result_t code,
                                   const char *message)
@@ -92,14 +95,53 @@ static int b_wifi_scan(void *user, net_ap_info_t *aps, int *count)
     int cap = *count;
     int n = 0;
 
-    /* PC 热点：catalog 存在有效记录时作为一条 2.4GHz AP 返回；无记录不返回 */
-    sim_ap_catalog_record_t rec;
-    if (sim_ap_catalog_read(b->catalog_dir, &rec, 0) == DEMO_OK) {
+    /* 本实例虚拟 AP */
+    {
+        int pos = 0;
+        sim_ap_t ap;
+        while (sim_world_ap_iterate(b->world, &pos, &ap)) {
+            if (n < cap && aps) {
+                memset(&aps[n], 0, sizeof(aps[n]));
+                sim_util_copy_bounded(aps[n].ssid, sizeof(aps[n].ssid), ap.ssid);
+                aps[n].rssi = -50;
+                aps[n].band_2g = 1;
+            }
+            n++;
+        }
+    }
+    /* 跨进程 catalog 记录的 AP（去重） */
+    {
+        sim_ap_catalog_record_t records[16];
+        int record_count = 0;
+        if (sim_ap_catalog_list(b->catalog_dir, records, 16, &record_count, 0) == DEMO_OK) {
+            int i;
+            for (i = 0; i < record_count; i++) {
+                int duplicate = 0;
+                int existing;
+                for (existing = 0; existing < n && existing < cap; existing++) {
+                    if (aps && strcmp(aps[existing].ssid, records[i].ssid) == 0)
+                        duplicate = 1;
+                }
+                if (duplicate)
+                    continue;
+                if (n < cap && aps) {
+                    memset(&aps[n], 0, sizeof(aps[n]));
+                    sim_util_copy_bounded(aps[n].ssid, sizeof(aps[n].ssid), records[i].ssid);
+                    aps[n].rssi = -50;
+                    aps[n].band_2g = 1;
+                }
+                n++;
+            }
+        }
+    }
+    /* 目标网络作为一个可见 AP（配网完成后 host 切回目标 WiFi 的场景） */
+    if (sim_world_target_up(b->world)) {
         if (n < cap && aps) {
             memset(&aps[n], 0, sizeof(aps[n]));
-            sim_util_copy_bounded(aps[n].ssid, sizeof(aps[n].ssid), rec.ssid);
-            aps[n].rssi = -50;
-            aps[n].band_2g = 1;
+            sim_util_copy_bounded(aps[n].ssid, sizeof(aps[n].ssid),
+                                  sim_world_target_ssid(b->world));
+            aps[n].rssi = -45;
+            aps[n].band_2g = sim_world_target_band_2g(b->world) ? 1 : 0;
         }
         n++;
     }
@@ -113,26 +155,24 @@ static int b_wifi_sta_connect(void *user, const char *ssid, const char *pass,
     sim_backend_t *b = (sim_backend_t *)user;
     if (!b || !ssid || !pass)
         return DEMO_ERR_INVAL;
-
-    /* 精确匹配 SSID；密码不符 → AUTH_FAIL；无有效记录 → NO_AP_FOUND */
-    int r = WIFI_REASON_NO_AP_FOUND;
-    sim_ap_catalog_record_t rec;
-    if (sim_ap_catalog_read(b->catalog_dir, &rec, 0) == DEMO_OK) {
-        if (strcmp(rec.ssid, ssid) == 0)
-            r = (strcmp(rec.password, pass) == 0) ? WIFI_REASON_OK
-                                                  : WIFI_REASON_AUTH_FAIL;
+    int r = sim_world_sta_connect(b->world, ssid, pass);
+    /* 本实例 world 未命中时，查跨进程 catalog（密码字段已冻结移除，
+     * 命中即视为可达 AP） */
+    if (r != 0) {
+        sim_ap_catalog_record_t record;
+        if (sim_ap_catalog_find_ssid(b->catalog_dir, ssid, &record, 0) == DEMO_OK)
+            r = 0;
     }
-
     if (reason)
         *reason = (wifi_reason_t)r;
-    if (r == WIFI_REASON_OK) {
+    if (r == 0) {
         b->sta_connected = 1;
         sim_util_copy_bounded(b->sta_ssid, sizeof(b->sta_ssid), ssid);
     } else {
         b->sta_connected = 0;
         b->sta_ssid[0] = 0;
     }
-    return r == WIFI_REASON_OK ? DEMO_OK : DEMO_ERR;
+    return r == 0 ? DEMO_OK : DEMO_ERR;
 }
 
 static int b_wifi_sta_disconnect(void *user)
@@ -147,19 +187,48 @@ static int b_wifi_sta_disconnect(void *user)
 
 static int b_wifi_ap_start(void *user, const char *ssid, const char *pass, const char *pin)
 {
-    (void)user;
-    (void)ssid;
-    (void)pass;
-    (void)pin;
-    /* beta v1.1：设备不再创建热点（PC 是唯一 publisher），返回不支持 */
-    return DEMO_ERR;
+    sim_backend_t *b = (sim_backend_t *)user;
+    if (!b || !ssid || !pass)
+        return DEMO_ERR_INVAL;
+    if (b->provision_port == 0 || b->provision_port > 65535)
+        return DEMO_ERR_INVAL; /* 未配置配网端口 → 无法发布有效 catalog */
+
+    sim_world_ap_register(b->world, b->tag, ssid, pass, pin ? pin : "",
+                          (uint16_t)b->provision_port);
+
+    sim_ap_catalog_record_t rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.schema = SIM_AP_CATALOG_SCHEMA;
+    rec.device_index = b->device_index;
+    sim_ap_catalog_build_device_id(b->device_index, rec.device_id, sizeof(rec.device_id));
+    sim_util_copy_bounded(rec.ssid, sizeof(rec.ssid), ssid);
+    sim_util_copy_bounded(rec.bssid, sizeof(rec.bssid), rec.device_id);
+    sim_util_copy_bounded(rec.logical_ip, sizeof(rec.logical_ip), PROTO_SIM_AP_IP);
+    sim_util_copy_bounded(rec.loopback_host, sizeof(rec.loopback_host), "127.0.0.1");
+    rec.provision_port = b->provision_port;
+    rec.published_at_ms = sim_ap_catalog_wallclock_ms();
+    rec.owner_pid = sim_ap_catalog_current_pid();
+
+    int rc = sim_ap_catalog_publish(b->catalog_dir, &rec);
+    if (rc != DEMO_OK) {
+        sim_world_ap_unregister(b->world, b->tag);
+        return rc;
+    }
+    b->ap_started = 1;
+    sim_util_copy_bounded(b->ap_ssid, sizeof(b->ap_ssid), ssid);
+    return DEMO_OK;
 }
 
 static int b_wifi_ap_stop(void *user)
 {
-    (void)user;
-    /* beta v1.1：设备不管理热点 */
-    return DEMO_ERR;
+    sim_backend_t *b = (sim_backend_t *)user;
+    if (!b)
+        return DEMO_ERR_INVAL;
+    sim_world_ap_unregister(b->world, b->tag);
+    sim_ap_catalog_remove(b->catalog_dir, b->device_index, sim_ap_catalog_current_pid());
+    b->ap_started = 0;
+    b->ap_ssid[0] = 0;
+    return DEMO_OK;
 }
 
 static int b_wifi_get_rssi(void *user, int *rssi)
@@ -176,8 +245,15 @@ static int b_wifi_get_ip(void *user, uint32_t *ip)
     sim_backend_t *b = (sim_backend_t *)user;
     if (!b || !ip)
         return DEMO_ERR_INVAL;
+    if (b->sta_connected && strcmp(b->sta_ssid, sim_world_target_ssid(b->world)) == 0 &&
+        !sim_world_target_up(b->world)) {
+        *ip = 0;
+        return DEMO_ERR;
+    }
     if (b->sta_connected)
         *ip = sim_world_device_sta_virtual_ip((int)b->device_index);
+    else if (b->ap_started)
+        *ip = sim_world_device_ap_virtual_ip();
     else
         *ip = 0;
     return DEMO_OK;
@@ -188,6 +264,9 @@ static int b_wifi_get_current_ssid(void *user, char *ssid, int capacity)
     sim_backend_t *b = (sim_backend_t *)user;
     if (!b || !ssid || capacity <= 0 || !b->sta_connected || !b->sta_ssid[0])
         return DEMO_ERR;
+    if (strcmp(b->sta_ssid, sim_world_target_ssid(b->world)) == 0 &&
+        !sim_world_target_up(b->world))
+        return DEMO_ERR;
     sim_util_copy_bounded(ssid, (size_t)capacity, b->sta_ssid);
     return DEMO_OK;
 }
@@ -197,7 +276,7 @@ static int b_wifi_get_gateway(void *user, uint32_t *ip)
     sim_backend_t *b = (sim_backend_t *)user;
     if (!b || !ip || !b->sta_connected)
         return DEMO_ERR;
-    *ip = sim_world_pc_ap_ip(); /* 192.168.137.1（PROTO_PC_AP_IP） */
+    *ip = sim_world_device_ap_virtual_ip();
     return DEMO_OK;
 }
 
@@ -216,22 +295,34 @@ static int b_tcp_accept(void *user, void *listen, void **conn, net_addr_t *peer)
 static int b_tcp_connect(void *user, const net_addr_t *addr, void **sock, int timeout_ms)
 {
     sim_backend_t *b = (sim_backend_t *)user;
-    if (!b || !addr)
+    if (!b)
+        return DEMO_ERR_INVAL;
+    if (!addr)
         return DEMO_ERR_INVAL;
 
-    /* PC 热点固定目标 192.168.137.1:5935 → 经 catalog 翻译到
-     * 127.0.0.1:<loopback_port>；其余地址不做该翻译。 */
-    int pc_match = (addr->ip == sim_world_pc_ap_ip() &&
-                    addr->port == sim_tcp_host_to_net16((uint16_t)PROTO_TCP_PORT));
-    uint16_t loopback_port = 0;
-    if (pc_match) {
-        sim_ap_catalog_record_t rec;
-        if (sim_ap_catalog_read(b->catalog_dir, &rec, 0) != DEMO_OK)
-            return DEMO_ERR; /* PC 未发布热点 → 固定目标无法翻译 */
-        loopback_port = (uint16_t)rec.loopback_port;
+    /* 连接模拟 AP 地址 → 经 catalog 翻译到 127.0.0.1:<provision_port>
+     * （旧实现取共享 world 首个 AP；新实现取 catalog 中索引最小的记录，
+     * 单设备场景语义一致）。 */
+    int ap_match = 0;
+    uint16_t ap_real_port_host = 0;
+    if (addr->ip == sim_world_device_ap_virtual_ip()) {
+        sim_ap_catalog_record_t records[16];
+        int count = 0;
+        if (sim_ap_catalog_list(b->catalog_dir, records, 16, &count, 0) == DEMO_OK &&
+            count > 0) {
+            int best = 0;
+            int i;
+            for (i = 1; i < count; i++) {
+                if (records[i].device_index < records[best].device_index)
+                    best = i;
+            }
+            ap_match = 1;
+            ap_real_port_host = (uint16_t)records[best].provision_port;
+        }
     }
-
-    sim_tcp_endpoint_t ep = sim_tcp_resolve_endpoint(0, addr, pc_match, loopback_port);
+    sim_tcp_endpoint_t ep = sim_tcp_resolve_endpoint(
+        0, addr, ap_match, ap_real_port_host,
+        sim_world_host_virtual_ip(), (uint16_t)PROTO_TCP_PORT);
     net_addr_t resolved;
     resolved.ip = ep.ip;
     resolved.port = ep.port;
@@ -378,6 +469,12 @@ static void sim_backend_destroy_user(void *user)
     sim_backend_t *b = (sim_backend_t *)user;
     if (!b)
         return;
+    if (b->ap_started) {
+        sim_world_ap_unregister(b->world, b->tag);
+        sim_ap_catalog_remove(b->catalog_dir, b->device_index,
+                              sim_ap_catalog_current_pid());
+        b->ap_started = 0;
+    }
     if (b->nvs)
         sim_nvs_close(b->nvs);
     if (b->world)
@@ -420,9 +517,14 @@ device_result_t device_sim_backend_create(
                               "sim_catalog_dir 必须为绝对路径");
         return DEVICE_ERR_INVALID_ARGUMENT;
     }
-    if (options->device_index > 15) {
+    if (options->device_index > SIM_AP_CATALOG_MAX_INDEX) {
         sim_backend_set_error(error, DEVICE_ERR_INVALID_ARGUMENT,
                               "device_index 必须在 0..15");
+        return DEVICE_ERR_INVALID_ARGUMENT;
+    }
+    if (options->provision_port > 65535) {
+        sim_backend_set_error(error, DEVICE_ERR_INVALID_ARGUMENT,
+                              "provision_port 必须在 0..65535");
         return DEVICE_ERR_INVALID_ARGUMENT;
     }
 
@@ -432,6 +534,7 @@ device_result_t device_sim_backend_create(
         return DEVICE_ERR_NO_MEMORY;
     }
     b->device_index = options->device_index;
+    b->provision_port = options->provision_port;
     snprintf(b->tag, sizeof(b->tag), "dev%u", options->device_index);
     sim_util_copy_bounded(b->catalog_dir, sizeof(b->catalog_dir), options->sim_catalog_dir);
     if (options->nvs_file && options->nvs_file[0])
@@ -439,6 +542,13 @@ device_result_t device_sim_backend_create(
     else
         sim_util_copy_bounded(b->nvs_file, sizeof(b->nvs_file),
                               sim_backend_nvs_default_path(b));
+    sim_util_copy_bounded(b->host_virtual_ip, sizeof(b->host_virtual_ip),
+                          (options->host_virtual_ip && options->host_virtual_ip[0])
+                              ? options->host_virtual_ip
+                              : kDefaultHostVirtualIp);
+    sim_util_copy_bounded(b->target_ssid, sizeof(b->target_ssid), options->target_ssid);
+    sim_util_copy_bounded(b->target_password, sizeof(b->target_password),
+                          options->target_password);
 
     b->world = sim_world_create();
     if (!b->world) {
@@ -446,6 +556,7 @@ device_result_t device_sim_backend_create(
         sim_backend_set_error(error, DEVICE_ERR_NO_MEMORY, "sim_world 创建失败");
         return DEVICE_ERR_NO_MEMORY;
     }
+    sim_world_target_set(b->world, b->target_ssid, b->target_password, 1);
 
     b->rng = sim_random_create(options->random_seed);
     if (!b->rng) {

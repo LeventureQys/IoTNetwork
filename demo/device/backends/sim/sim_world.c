@@ -472,7 +472,7 @@ int sim_world_mcast_is_blocked(const sim_world_t *w, const char *tag)
     return blocked;
 }
 
-/* ---------------- 虚拟 IP（beta v1.1 角色反转语义） ---------------- */
+/* ---------------- 虚拟 IP（语义冻结） ---------------- */
 
 static uint32_t world_ip_of(const char *s)
 {
@@ -482,11 +482,17 @@ static uint32_t world_ip_of(const char *s)
     return (uint32_t)((d << 24) | (c << 16) | (b << 8) | a);
 }
 
-uint32_t sim_world_pc_ap_ip(void) { return world_ip_of(PROTO_PC_AP_IP); }
+uint32_t sim_world_host_virtual_ip(void) { return world_ip_of("192.168.1.50"); }
+uint32_t sim_world_device_ap_virtual_ip(void) { return world_ip_of(PROTO_SIM_AP_IP); }
 
 uint32_t sim_world_device_sta_virtual_ip(int dev_index)
 {
     char buf[32];
-    snprintf(buf, sizeof(buf), "192.168.137.%d", 100 + dev_index);
+    snprintf(buf, sizeof(buf), "192.168.1.%d", 100 + dev_index);
     return world_ip_of(buf);
+}
+
+uint16_t sim_world_device_ap_real_port(int base, int dev_index)
+{
+    return (uint16_t)(base + dev_index);
 }

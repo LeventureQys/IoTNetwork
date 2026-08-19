@@ -1,26 +1,24 @@
 {
-  "power_on_jitter_max_ms": 1000,
-  "wifi_retry_max": 5,
-  "wifi_backoff_base_ms": 1000,
-  "wifi_backoff_cap_ms": 30000,
-  "wifi_backoff_jitter_ms": 5000,
-  "heartbeat_interval_ms": 2000,
-  "heartbeat_dead_ms": 0,
-  "busy_backoff_ms": 6000,
-  "hello_timeout_ms": 5000,
-  "reconnect_backoff_base_ms": 1000,
-  "reconnect_backoff_cap_ms": 5000,
-  "reconnect_backoff_jitter_ms": 500,
-  "malformed_max_per_conn": 3,
-  "device_rate_limit_per_sec": 50,
-  "host_tcp_port": 5935,
-  "pc_ap_ssid": "Modu_PC",
-  "pc_ap_password": "modu_leventure",
-  "pc_host_ip": "192.168.137.1",
-  "nvs_dir": "run",
+  "schema": 1,
+  "enable": true,
+  "sta_interface": "",
+  "hs_config_path": "linux_hotspot.json",
+  "hotspot_config_path": "config/linux_hotspot.json",
+  "nvs_file": "run/device_linux.nvs.json",
   "use_real_wifi_sta": 1,
-  "device_fw_version": "1.0.0",
-  "device_proto_ver": 1,
-  "duration_s": 0,
-  "config_tag": "device-linux"
+  "protocol": {
+    "protocol_version": 1,
+    "tcp_port": 5935,
+    "multicast_group": "224.0.2.1",
+    "multicast_port": 5936,
+    "mdns_type": "_tactile._tcp",
+    "max_payload": 1024,
+    "app_data_text_bytes": 512,
+    "session_id_length": 8
+  },
+  "persistence_keys": [
+    "wifi_creds",
+    "host_candidates",
+    "evlog"
+  ]
 }

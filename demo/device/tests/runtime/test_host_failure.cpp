@@ -104,15 +104,3 @@ TEST_F(FailureTest, ConfigInvalidFailsCreate)
     EXPECT_EQ(device_host_create(&o, &h, &e), DEVICE_ERR_CONFIG_INVALID);
     EXPECT_EQ(h, nullptr);
 }
-
-TEST_F(FailureTest, ConfigBadValuesFailClosed)
-{
-    /* 固定契约值非法（密码错）→ 校验失败，fail-closed 启动失败 */
-    WriteConfig(dir, "{\"pc_ap_password\":\"wrong-pass-123\"}");
-    std::string cfg_path;
-    device_host_options_t o = MakeOptions(dir, &cfg_path);
-    device_host_t *h = nullptr;
-    device_error_t e;
-    EXPECT_EQ(device_host_create(&o, &h, &e), DEVICE_ERR_CONFIG_INVALID);
-    EXPECT_EQ(h, nullptr);
-}

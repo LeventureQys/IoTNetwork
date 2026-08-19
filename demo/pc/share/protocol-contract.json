@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 1,
   "generated_from": "demo/pc/include/pc/protocol.h",
   "protocol_version": 1,
   "frame": {
@@ -8,34 +8,68 @@
     "max_payload": 1024
   },
   "tcp": {
-    "host_ip": "192.168.137.1",
-    "port": 5935,
-    "max_connections": 1
+    "port": 5935
   },
-  "wifi": {
-    "ssid_prefix": "Modu_",
-    "default_ssid": "Modu_PC",
-    "password": "modu_leventure",
-    "prefix_length": 24
+  "discovery": {
+    "multicast_group": "224.0.2.1",
+    "multicast_port": 5936,
+    "mdns_type": "_tactile._tcp",
+    "mdns_instance": "host"
   },
   "limits": {
     "app_data_text_bytes": 512,
-    "session_id_length": 8
+    "session_id_length": 8,
+    "wifi_cred_max": 2,
+    "candidate_max": 2,
+    "host_max_conn": 16
+  },
+  "sim": {
+    "ap_ip": "192.168.1.1"
   },
   "commands": [
+    "auth",
+    "auth_result",
+    "wifi_config",
+    "wifi_result",
+    "close_ap",
+    "host_announce",
+    "host_bye",
     "device_hello",
     "host_ack",
     "ping",
     "pong",
+    "diag_query",
+    "diag_report",
     "app_data"
   ],
+  "wifi_reason_codes": {
+    "ok": 0,
+    "no_ap_found": 201,
+    "auth_fail": 202,
+    "handshake_timeout": 205,
+    "band_5g": 500
+  },
   "device_states": {
     "boot": 0,
-    "wifi_scan": 1,
-    "sta_join": 2,
-    "connect": 3,
-    "session": 4,
-    "heal": 5,
-    "count": 6
+    "sta_join": 1,
+    "ap_provision": 2,
+    "discovery": 3,
+    "connect": 4,
+    "session": 5,
+    "heal": 6,
+    "count": 7
+  },
+  "persistence_keys": [
+    "wifi_creds",
+    "host_candidates",
+    "evlog"
+  ],
+  "error_codes": {
+    "ok": 0,
+    "err": -1,
+    "err_nomem": -2,
+    "err_inval": -3,
+    "err_again": -4,
+    "err_timeout": -5
   }
 }

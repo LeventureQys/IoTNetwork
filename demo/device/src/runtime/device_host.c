@@ -69,6 +69,12 @@ static void host_snapshot_update(device_host_t *host)
         host->snapshot.uptime_seconds = app->snap_uptime_s;
         host->snapshot.session_online =
             (app->state == DEV_STATE_SESSION && app->sess_sock != NULL) ? 1 : 0;
+        snprintf(host->snapshot.ap_ssid, sizeof(host->snapshot.ap_ssid), "%s",
+                 app->ap_ssid);
+        snprintf(host->snapshot.ap_password, sizeof(host->snapshot.ap_password), "%s",
+                 app->ap_password);
+        snprintf(host->snapshot.provision_pin, sizeof(host->snapshot.provision_pin), "%s",
+                 app->ap_pin);
     }
     host->plat->mutex_unlock(host->snapshot_mutex);
 }
@@ -216,17 +222,6 @@ device_result_t device_host_create_internal(const device_host_options_t *options
         }
     }
 
-    /* 2.1 配置校验（fail-closed：SSID/密码/IP/端口/退避非法 → 启动失败） */
-    {
-        char validate_error[256];
-        if (device_config_validate(&host->cfg, validate_error,
-                                   (int)sizeof(validate_error)) != DEMO_OK) {
-            fail_rc = DEVICE_ERR_CONFIG_INVALID;
-            err_set(error, fail_rc, 0, "create", validate_error);
-            goto fail;
-        }
-    }
-
     /* 3. 运行目录（--runtime-dir 覆盖配置 nvs_dir） */
     {
         char runtime_dir[1024] = {0};
@@ -359,11 +354,11 @@ device_result_t device_host_create_internal(const device_host_options_t *options
              options->device_index + 1);
     snprintf(host->snapshot.device_id, sizeof(host->snapshot.device_id), "%s",
              host->device_id);
-    snprintf(host->snapshot.target_ssid, sizeof(host->snapshot.target_ssid), "%s",
-             host->cfg.pc_ap_ssid);
-    snprintf(host->snapshot.pc_host_ip, sizeof(host->snapshot.pc_host_ip), "%s",
-             host->cfg.pc_host_ip);
-    host->snapshot.pc_host_port = host->cfg.host_tcp_port;
+    host->provision_port = host->cfg.use_real_wifi_sta
+                               ? PROTO_TCP_PORT
+                               : (int)(host->cfg.device_ap_port_base +
+                                       options->device_index);
+    host->snapshot.provision_port = host->provision_port;
 
     /* 9. 日志 sink 注册 */
     g_sink_host = host;
@@ -377,13 +372,20 @@ device_result_t device_host_create_internal(const device_host_options_t *options
         sim_opts.nvs_file = host->nvs_file;
         sim_opts.sim_catalog_dir = host->sim_catalog_dir[0] ? host->sim_catalog_dir
                                                             : NULL;
+        sim_opts.target_ssid = host->cfg.target_ssid;
+        sim_opts.target_password = host->cfg.target_password;
+        sim_opts.host_virtual_ip = "127.0.0.1";
         sim_opts.device_index = options->device_index;
+        sim_opts.provision_port = (unsigned int)host->provision_port;
         sim_opts.random_seed = (uint32_t)(options->device_index + 1) * 2654435761u;
 
         device_linux_backend_options_t linux_opts;
         memset(&linux_opts, 0, sizeof(linux_opts));
         linux_opts.config_path = host->config_path[0] ? host->config_path : NULL;
         linux_opts.nvs_file = host->nvs_file;
+        linux_opts.hotspot_config_path = host->cfg.hs_config_path[0]
+                                             ? host->cfg.hs_config_path
+                                             : NULL;
         linux_opts.sta_interface = NULL;
         linux_opts.device_index = options->device_index;
 

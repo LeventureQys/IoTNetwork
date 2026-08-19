@@ -42,6 +42,23 @@ static inline void WriteConfig(const std::string &dir, const char *content)
     WriteFile(dir + "/device_sim.json", content);
 }
 
+/* 在 <dir>/run/dev<idx>.nvs.json 预置凭据（模拟端假后端读 NVS 文件；
+ * 值经 cJSON 转义，格式与真实 NVS blob 一致） */
+static inline void PreseedCreds(const std::string &dir, unsigned int idx,
+                                const char *creds_json)
+{
+    std::error_code ec;
+    std::filesystem::create_directories(dir + "/run", ec);
+    cJSON *root = cJSON_CreateObject();
+    ASSERT_NE(root, nullptr);
+    cJSON_AddStringToObject(root, "wifi_creds", creds_json);
+    char *s = cJSON_PrintUnformatted(root);
+    ASSERT_NE(s, nullptr);
+    WriteFile(dir + "/run/dev" + std::to_string(idx) + ".nvs.json", s);
+    free(s);
+    cJSON_Delete(root);
+}
+
 /* config_path 字符串必须存活到 create 之后（host 在 create 内复制）；
  * 由调用方提供的 cfg_path 持有。 */
 static inline device_host_options_t MakeOptions(const std::string &dir,

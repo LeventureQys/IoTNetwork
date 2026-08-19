@@ -13,10 +13,10 @@ extern "C" {
  * - 文件 schema 固定为 { schema:1, actions:[...] }；
  * - action 一次一结果：每个 target=device 的 action 恰好产生一条同 action_id
  *   的 scenario_result 事件（status=ok|rejected|failed）；
- * - after_event 门控：ready|session_online|session_offline|null；
+ * - after_event 门控：ready|ap_ready|session_online|session_offline|null；
  * - delay_ms 范围 0~60000；
- * - send_app_data.args 需要 text；inject_fault.args 需要 name、可选 argument_json；
- *   request_stop.args 必须为空对象；
+ * - auto_provision.args 需要 ssid/password；send_app_data.args 需要 text；
+ *   inject_fault.args 需要 name、可选 argument_json；request_stop.args 必须为空对象；
  * - target=pc 的 action 忽略（不产生 scenario_result）；
  * - target=当前进程但 action/args/schema 非法时创建失败（启动失败）。
  *

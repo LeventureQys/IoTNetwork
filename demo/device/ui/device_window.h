@@ -43,7 +43,7 @@ private:
     FlowWidget *flow_widget_;
     QListView *log_view_;
     QLabel *state_label_;
-    QLabel *target_label_;
+    QLabel *ap_label_;
     QLabel *session_label_;
     QLabel *error_label_;
     QComboBox *action_box_;

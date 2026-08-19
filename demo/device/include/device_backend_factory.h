@@ -19,13 +19,18 @@ typedef struct device_sim_backend_options {
     const char *config_path;
     const char *nvs_file;
     const char *sim_catalog_dir;
+    const char *target_ssid;
+    const char *target_password;
+    const char *host_virtual_ip;
     unsigned int device_index;
+    unsigned int provision_port;
     uint32_t random_seed;
 } device_sim_backend_options_t;
 
 typedef struct device_linux_backend_options {
     const char *config_path;
     const char *nvs_file;
+    const char *hotspot_config_path;
     const char *sta_interface;
     unsigned int device_index;
 } device_linux_backend_options_t;

@@ -6,27 +6,17 @@
 #include <QVector>
 #include <QWidget>
 
-/* PC 端一对一流程节点：启动、热点启动、固定 IP、TCP 监听、设备握手、会话在线。 */
 class HandshakeFlowWidget : public QWidget {
 public:
+    enum class Side { Host, Device };
     enum class NodeState { Pending, Active, Success, Failed, Retrying };
 
-    explicit HandshakeFlowWidget(QWidget *parent = nullptr);
+    explicit HandshakeFlowWidget(Side side, QWidget *parent = nullptr);
 
     void PushLog(const QString &message);
     void DrainEvents();
-    /* registered：已注册设备数；online：在线设备数 */
-    void SetHostState(int registered, int online);
-
-    /* 测试观察口：节点数量与标题（不暴露内部状态） */
-    int nodeCount() const { return nodes_.size(); }
-    QStringList nodeTitles() const
-    {
-        QStringList titles;
-        for (const Node &node : nodes_)
-            titles.append(node.title);
-        return titles;
-    }
+    void SetDeviceState(int state);
+    void SetHostState(bool provisioning, int done, int total, int registered, int online);
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -48,6 +38,7 @@ private:
     void MarkThrough(int index);
     void SetBehavior(const QString &behavior, const QString &protocol = QString());
 
+    Side side_;
     QVector<Node> nodes_;
     QString behavior_;
     QString protocol_;

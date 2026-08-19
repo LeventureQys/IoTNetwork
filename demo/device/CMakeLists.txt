@@ -52,6 +52,8 @@ add_library(device_core STATIC
     src/core/device_app.c
     src/core/device_eventlog.c
     src/core/device_limits.c
+    src/core/device_provision.c
+    src/core/device_discovery.c
     src/core/device_session.c
     src/core/device_heal.c
 )

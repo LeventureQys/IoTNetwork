@@ -11,6 +11,7 @@
 #define TAG "LINUX_WIFI"
 
 struct linux_wifi {
+    linux_hotspot_t *hotspot;
     char sta_iface[32];
     linux_wifi_ops_t ops;   /* 复制注入表，保留 exec_argv；无注入时置 NULL */
 };
@@ -23,23 +24,22 @@ static int exec_capture(linux_wifi_t *wifi, const char *const argv[],
     return linux_exec_argv(argv, output, output_capacity);
 }
 
-int linux_wifi_create(linux_wifi_t **out, const char *sta_interface,
+int linux_wifi_create(linux_wifi_t **out, linux_hotspot_t *hotspot,
                       const linux_wifi_ops_t *ops_override)
 {
     linux_wifi_t *wifi;
 
-    if (out == NULL)
+    if (out == NULL || hotspot == NULL)
         return DEMO_ERR_INVAL;
     *out = NULL;
     wifi = (linux_wifi_t *)calloc(1, sizeof(*wifi));
     if (wifi == NULL)
         return DEMO_ERR_NOMEM;
+    wifi->hotspot = hotspot;
     if (ops_override != NULL)
         wifi->ops = *ops_override;
-    if (sta_interface != NULL && sta_interface[0] != '\0')
-        snprintf(wifi->sta_iface, sizeof(wifi->sta_iface), "%s", sta_interface);
-    else
-        snprintf(wifi->sta_iface, sizeof(wifi->sta_iface), "%s", "wlP2p33s0");
+    snprintf(wifi->sta_iface, sizeof(wifi->sta_iface), "%s",
+             linux_hotspot_sta_interface(hotspot));
     LOG_I(TAG, "WiFi STA 接口: %s", wifi->sta_iface);
     *out = wifi;
     return DEMO_OK;

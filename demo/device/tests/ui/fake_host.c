@@ -31,11 +31,12 @@ void fake_host_init(void)
     g_snap.device_state = 0;
     g_snap.rssi_dbm = -50;
     g_snap.uptime_seconds = 42;
+    g_snap.provision_port = 20000;
     g_snap.backend_kind = DEVICE_BACKEND_SIM;
     snprintf(g_snap.device_id, sizeof(g_snap.device_id), "02:00:00:00:00:01");
-    snprintf(g_snap.target_ssid, sizeof(g_snap.target_ssid), "Modu_PC");
-    snprintf(g_snap.pc_host_ip, sizeof(g_snap.pc_host_ip), "192.168.137.1");
-    g_snap.pc_host_port = 5935;
+    snprintf(g_snap.ap_ssid, sizeof(g_snap.ap_ssid), "Modu_0001");
+    snprintf(g_snap.ap_password, sizeof(g_snap.ap_password), "modutech_leventure");
+    snprintf(g_snap.provision_pin, sizeof(g_snap.provision_pin), "5935");
     snprintf(g_snap.backend_name, sizeof(g_snap.backend_name), "sim");
     g_drain_rc = DEVICE_OK;
     g_log_count = 0;

@@ -1,6 +1,5 @@
 #include "net_abstraction.h"
 #include <stdlib.h>
-#include <string.h>
 
 struct net_ctx {
     const net_backend_t *backend;
@@ -74,25 +73,6 @@ int net_wifi_ap_start(net_ctx_t *c, const char *ssid, const char *pass, const ch
     if (!c || !c->backend || !c->backend->wifi_ap_start)
         return DEMO_ERR_INVAL;
     return c->backend->wifi_ap_start(c->user, ssid, pass, pin);
-}
-
-int net_wifi_ap_status(net_ctx_t *c, net_ap_status_t *status)
-{
-    if (!status)
-        return DEMO_ERR_INVAL;
-    memset(status, 0, sizeof(*status));
-    if (!c || !c->backend || !c->backend->wifi_ap_status)
-        return DEMO_ERR; /* 不支持平台/热点未运行：统一 DEMO_ERR（设计文档 7.1） */
-    return c->backend->wifi_ap_status(c->user, status);
-}
-
-int net_wifi_ap_configure_ipv4(net_ctx_t *c, const char *ipv4, int prefix_length)
-{
-    if (!ipv4)
-        return DEMO_ERR_INVAL;
-    if (!c || !c->backend || !c->backend->wifi_ap_configure_ipv4)
-        return DEMO_ERR;
-    return c->backend->wifi_ap_configure_ipv4(c->user, ipv4, prefix_length);
 }
 
 int net_wifi_get_rssi(net_ctx_t *c, int *rssi)

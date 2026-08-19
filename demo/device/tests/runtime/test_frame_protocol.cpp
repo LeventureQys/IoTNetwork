@@ -113,8 +113,9 @@ TEST(FrameParse, NullArgs)
 TEST(Protocol, StateStr)
 {
     EXPECT_STREQ(device_state_str(DEV_STATE_BOOT), "boot");
-    EXPECT_STREQ(device_state_str(DEV_STATE_WIFI_SCAN), "wifi_scan");
     EXPECT_STREQ(device_state_str(DEV_STATE_STA_JOIN), "sta_join");
+    EXPECT_STREQ(device_state_str(DEV_STATE_AP_PROVISION), "ap_provision");
+    EXPECT_STREQ(device_state_str(DEV_STATE_DISCOVERY), "discovery");
     EXPECT_STREQ(device_state_str(DEV_STATE_CONNECT), "connect");
     EXPECT_STREQ(device_state_str(DEV_STATE_SESSION), "session");
     EXPECT_STREQ(device_state_str(DEV_STATE_HEAL), "heal");
@@ -123,11 +124,19 @@ TEST(Protocol, StateStr)
 
 TEST(Protocol, CommandNames)
 {
-    /* beta v1.1：仅保留握手/心跳/应用数据 5 条命令 */
+    EXPECT_STREQ(CMD_AUTH, "auth");
+    EXPECT_STREQ(CMD_AUTH_RESULT, "auth_result");
+    EXPECT_STREQ(CMD_WIFI_CONFIG, "wifi_config");
+    EXPECT_STREQ(CMD_WIFI_RESULT, "wifi_result");
+    EXPECT_STREQ(CMD_CLOSE_AP, "close_ap");
+    EXPECT_STREQ(CMD_HOST_ANNOUNCE, "host_announce");
+    EXPECT_STREQ(CMD_HOST_BYE, "host_bye");
     EXPECT_STREQ(CMD_DEVICE_HELLO, "device_hello");
     EXPECT_STREQ(CMD_HOST_ACK, "host_ack");
     EXPECT_STREQ(CMD_PING, "ping");
     EXPECT_STREQ(CMD_PONG, "pong");
+    EXPECT_STREQ(CMD_DIAG_QUERY, "diag_query");
+    EXPECT_STREQ(CMD_DIAG_REPORT, "diag_report");
     EXPECT_STREQ(CMD_APP_DATA, "app_data");
 }
 

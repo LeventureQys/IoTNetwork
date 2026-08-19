@@ -11,16 +11,15 @@ void ok_deinit(void *) {}
 
 const net_backend_t fail_init_table = {
     fail_init, ok_deinit, /* init / deinit */
-    nullptr, nullptr, nullptr,                                  /* wifi scan/sta */
-    nullptr, nullptr, nullptr, nullptr,                         /* ap start/stop/status/configure */
-    nullptr, nullptr, nullptr, nullptr,                         /* rssi/get_ip/ssid/gateway */
-    nullptr, nullptr, nullptr,                                  /* tcp */
-    nullptr, nullptr, nullptr,                                  /* sock */
-    nullptr, nullptr, nullptr,                                  /* udp */
-    nullptr, nullptr, nullptr,                                  /* mdns */
-    nullptr, nullptr, nullptr,                                  /* nvs */
-    nullptr, nullptr,                                          /* time/random */
-    nullptr,                                                   /* inject */
+    nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr,
+    nullptr, nullptr,
+    nullptr,
 };
 
 int ok_init(void *, const char *) { return DEMO_OK; }
@@ -30,8 +29,7 @@ void count_deinit(void *) { g_deinit_calls++; }
 const net_backend_t ok_init_table = {
     ok_init, count_deinit,
     nullptr, nullptr, nullptr,
-    nullptr, nullptr, nullptr, nullptr,
-    nullptr, nullptr, nullptr, nullptr,
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
     nullptr, nullptr, nullptr,
     nullptr, nullptr, nullptr,
     nullptr, nullptr, nullptr,
@@ -67,12 +65,6 @@ TEST(NetAbstraction, NullCtxSafe)
     EXPECT_EQ(net_time_ms(nullptr), 0u);
     EXPECT_EQ(net_random(nullptr), 0u);
     EXPECT_EQ(net_inject(nullptr, "a", nullptr), DEMO_ERR_INVAL);
-
-    net_ap_status_t status;
-    EXPECT_EQ(net_wifi_ap_status(nullptr, &status), DEMO_ERR);
-    EXPECT_EQ(net_wifi_ap_status(nullptr, nullptr), DEMO_ERR_INVAL);
-    EXPECT_EQ(net_wifi_ap_configure_ipv4(nullptr, "192.168.137.1", 24), DEMO_ERR);
-    EXPECT_EQ(net_wifi_ap_configure_ipv4(nullptr, nullptr, 24), DEMO_ERR_INVAL);
 }
 
 TEST(NetAbstraction, NullMemberTableSafe)
@@ -90,9 +82,6 @@ TEST(NetAbstraction, NullMemberTableSafe)
     EXPECT_EQ(gateway, 0u);
     void *sock = nullptr;
     EXPECT_EQ(net_tcp_listen(ctx, 1, &sock), DEMO_ERR_INVAL);
-    net_ap_status_t status;
-    EXPECT_EQ(net_wifi_ap_status(ctx, &status), DEMO_ERR); /* 未实现 → DEMO_ERR */
-    EXPECT_EQ(net_wifi_ap_configure_ipv4(ctx, "192.168.137.1", 24), DEMO_ERR);
     net_ctx_destroy(ctx);
 }
 

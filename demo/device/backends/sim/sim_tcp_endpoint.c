@@ -1,8 +1,6 @@
 /* ============================================================================
  * sim_tcp_endpoint.c - 模拟地址 → loopback 解析（纯函数，无全局状态）。
- *
- * beta v1.1 角色反转语义：仅 PC 热点固定目标命中时翻译到 loopback，
- * 其余地址不翻译（保持请求端点）。
+ * 迁移自旧 net_sim/sim_tcp_endpoint.cpp，逻辑逐字等价。
  * ========================================================================== */
 #include "sim_tcp_endpoint.h"
 
@@ -26,7 +24,7 @@ static uint32_t loopback_ip(void)
     return net_ipv4(127, 0, 0, 1);
 }
 
-uint16_t sim_tcp_host_to_net16(uint16_t value)
+static uint16_t host_to_net16(uint16_t value)
 {
     union {
         uint16_t u16;
@@ -41,8 +39,10 @@ uint16_t sim_tcp_host_to_net16(uint16_t value)
 sim_tcp_endpoint_t sim_tcp_resolve_endpoint(
     int real_device_mode,
     const net_addr_t *requested,
-    int simulated_pc_match,
-    uint16_t simulated_pc_loopback_port_host_order)
+    int simulated_ap_match,
+    uint16_t simulated_ap_real_port_host_order,
+    uint32_t simulated_host_ip_network_order,
+    uint16_t simulated_host_port_host_order)
 {
     sim_tcp_endpoint_t out;
     out.ip = 0;
@@ -51,18 +51,19 @@ sim_tcp_endpoint_t sim_tcp_resolve_endpoint(
         return out;
 
     if (real_device_mode) {
-        /* 真实模式：不做任何翻译。 */
+        /* 真实模式：直接使用服务发现返回的真实端点，不做任何翻译。 */
         out.ip = requested->ip;
         out.port = requested->port;
         return out;
     }
 
-    if (simulated_pc_match) {
-        out.ip = loopback_ip();
-        out.port = sim_tcp_host_to_net16(simulated_pc_loopback_port_host_order);
+    out.ip = loopback_ip();
+    if (simulated_ap_match) {
+        out.port = host_to_net16(simulated_ap_real_port_host_order);
+    } else if (requested->ip == simulated_host_ip_network_order) {
+        out.port = host_to_net16(simulated_host_port_host_order);
     } else {
-        /* 其余地址不做翻译。 */
-        out.ip = requested->ip;
+        /* 保持既有模拟兼容行为：未知地址映射 loopback，端口沿用请求值。 */
         out.port = requested->port;
     }
     return out;

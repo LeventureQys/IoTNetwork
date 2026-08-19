@@ -35,6 +35,8 @@ struct CoreFixture {
         device_sim_backend_options_t opts;
         memset(&opts, 0, sizeof(opts));
         opts.nvs_file = nvs_path.c_str();
+        opts.target_ssid = cfg.target_ssid;
+        opts.target_password = cfg.target_password;
         opts.device_index = 0;
         device_error_t e;
         ASSERT_EQ(device_sim_backend_create(&opts, &inst, &e), DEVICE_OK);

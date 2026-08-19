@@ -1,5 +1,4 @@
 #include "device_config.h"
-#include "protocol.h"
 #include "device_path.h"
 #include "cJSON.h"
 #include "log.h"
@@ -15,21 +14,45 @@ void device_config_defaults(device_config_t *cfg)
     cfg->wifi_backoff_base_ms = 1000;
     cfg->wifi_backoff_cap_ms = 30000;
     cfg->wifi_backoff_jitter_ms = 5000;
+    cfg->provision_auth_timeout_ms = 10000;
+    cfg->provision_wifi_cfg_timeout_ms = 60000;
+    cfg->provision_ap_idle_timeout_ms = 120000;
+    cfg->provision_ap_backoff_ms = 300000;
+    cfg->provision_pin_fail_max = 5;
+    cfg->provision_confirm_window_ms = 120000;
+    cfg->provision_sta_try_max = 3;
+    cfg->provision_handoff_grace_ms = 1000;
+    cfg->discovery_fast_window_ms = 30000;
+    cfg->discovery_fast_interval_ms = 500;
+    cfg->discovery_normal_interval_ms = 1000;
+    cfg->discovery_candidate_timeout_ms = 30000;
     cfg->heartbeat_interval_ms = 10000;
     cfg->heartbeat_dead_ms = 0;
+    cfg->host_max_conn = 16;
     cfg->busy_backoff_ms = 60000;
     cfg->hello_timeout_ms = 5000;
+    cfg->rssi_sample_interval_ms = 5000;
+    cfg->rssi_bad_threshold_dbm = -75;
+    cfg->rssi_bad_duration_ms = 30000;
     cfg->reconnect_backoff_base_ms = 1000;
     cfg->reconnect_backoff_cap_ms = 30000;
     cfg->reconnect_backoff_jitter_ms = 5000;
+    cfg->reconnect_to_discovery_ms = 30000;
+    cfg->watchdog_state_timeout_ms = 60000;
     cfg->malformed_max_per_conn = 3;
     cfg->device_rate_limit_per_sec = 50;
-    cfg->host_tcp_port = PROTO_TCP_PORT;
-    snprintf(cfg->pc_ap_ssid, sizeof(cfg->pc_ap_ssid), "%s", PROTO_PC_AP_DEFAULT_SSID);
-    snprintf(cfg->pc_ap_password, sizeof(cfg->pc_ap_password), "%s", PROTO_PC_AP_PASSWORD);
-    snprintf(cfg->pc_host_ip, sizeof(cfg->pc_host_ip), "%s", PROTO_PC_AP_IP);
+    cfg->host_tcp_port = 5935;
+    snprintf(cfg->host_virtual_ip, sizeof(cfg->host_virtual_ip), "192.168.1.50");
+    snprintf(cfg->mcast_group, sizeof(cfg->mcast_group), "%s", "224.0.2.1");
+    cfg->mcast_port = 5936;
+    cfg->device_ap_port_base = 20000;
     snprintf(cfg->nvs_dir, sizeof(cfg->nvs_dir), "run");
+    snprintf(cfg->hs_config_path, sizeof(cfg->hs_config_path), "config/linux_hotspot.json");
     cfg->use_real_wifi_sta = 0;
+    cfg->device_count = 1;
+    snprintf(cfg->target_ssid, sizeof(cfg->target_ssid), "TactileFactory-2.4G");
+    snprintf(cfg->target_password, sizeof(cfg->target_password), "securepass123");
+    cfg->target_band_2g = 1;
     snprintf(cfg->device_fw_version, sizeof(cfg->device_fw_version), "1.0.0");
     cfg->device_proto_ver = 1;
     cfg->duration_s = 0;
@@ -125,21 +148,50 @@ int device_config_load(device_config_t *cfg, const char *json_path,
     LOAD_INT(wifi_backoff_base_ms);
     LOAD_INT(wifi_backoff_cap_ms);
     LOAD_INT(wifi_backoff_jitter_ms);
+    LOAD_INT(provision_auth_timeout_ms);
+    LOAD_INT(provision_wifi_cfg_timeout_ms);
+    LOAD_INT(provision_ap_idle_timeout_ms);
+    LOAD_INT(provision_ap_backoff_ms);
+    LOAD_INT(provision_pin_fail_max);
+    LOAD_INT(provision_confirm_window_ms);
+    LOAD_INT(provision_sta_try_max);
+    LOAD_INT(provision_handoff_grace_ms);
+    LOAD_INT(discovery_fast_window_ms);
+    LOAD_INT(discovery_fast_interval_ms);
+    LOAD_INT(discovery_normal_interval_ms);
+    LOAD_INT(discovery_candidate_timeout_ms);
     LOAD_INT(heartbeat_interval_ms);
     LOAD_INT(heartbeat_dead_ms);
+    LOAD_INT(host_max_conn);
     LOAD_INT(busy_backoff_ms);
     LOAD_INT(hello_timeout_ms);
+    LOAD_INT(rssi_sample_interval_ms);
+    LOAD_INT(rssi_bad_threshold_dbm);
+    LOAD_INT(rssi_bad_duration_ms);
     LOAD_INT(reconnect_backoff_base_ms);
     LOAD_INT(reconnect_backoff_cap_ms);
     LOAD_INT(reconnect_backoff_jitter_ms);
+    LOAD_INT(reconnect_to_discovery_ms);
+    LOAD_INT(watchdog_state_timeout_ms);
     LOAD_INT(malformed_max_per_conn);
     LOAD_INT(device_rate_limit_per_sec);
     LOAD_INT(host_tcp_port);
-    LOAD_STR(pc_ap_ssid);
-    LOAD_STR(pc_ap_password);
-    LOAD_STR(pc_host_ip);
+    LOAD_STR(host_virtual_ip);
+    LOAD_STR(mcast_group);
+    LOAD_INT(mcast_port);
+    LOAD_INT(device_ap_port_base);
     LOAD_STR(nvs_dir);
+    LOAD_STR(hs_config_path);
+    {
+        cJSON *legacy = cJSON_GetObjectItemCaseSensitive(root, "linux_hotspot_config");
+        if (cJSON_IsString(legacy))
+            copy_str(cfg->hs_config_path, (int)sizeof(cfg->hs_config_path), legacy->valuestring);
+    }
     LOAD_INT(use_real_wifi_sta);
+    LOAD_INT(device_count);
+    LOAD_STR(target_ssid);
+    LOAD_STR(target_password);
+    LOAD_INT(target_band_2g);
     LOAD_STR(device_fw_version);
     LOAD_INT(device_proto_ver);
     LOAD_INT(duration_s);
@@ -162,86 +214,9 @@ int device_config_load(device_config_t *cfg, const char *json_path,
 
     /* 配置内相对路径按配置目录解析 */
     resolve_config_path(cfg->nvs_dir, sizeof(cfg->nvs_dir), config_dir);
+    resolve_config_path(cfg->hs_config_path, sizeof(cfg->hs_config_path), config_dir);
     resolve_config_path(cfg->scenario_path, sizeof(cfg->scenario_path), config_dir);
 
     cJSON_Delete(root);
     return DEMO_OK;
-}
-
-/* SSID/密码/IP/端口固定值校验（两端一致）；写字段级中文错误，绝不回显密码。 */
-static int validate_cross_fields(const char *ssid, const char *password,
-                                 const char *ip, int port,
-                                 char *error, int error_capacity)
-{
-    size_t len = strlen(ssid);
-    size_t prefix_len = strlen(PROTO_PC_AP_PREFIX);
-    if (len < 6 || len > 32) {
-        snprintf(error, error_capacity, "热点SSID长度必须为 6~32 字节");
-        return DEMO_ERR_INVAL;
-    }
-    if (strncmp(ssid, PROTO_PC_AP_PREFIX, prefix_len) != 0) {
-        snprintf(error, error_capacity, "热点SSID必须以 Modu_ 开头");
-        return DEMO_ERR_INVAL;
-    }
-    for (size_t i = prefix_len; i < len; i++) {
-        char c = ssid[i];
-        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-              (c >= '0' && c <= '9') || c == '-' || c == '_')) {
-            snprintf(error, error_capacity, "热点SSID后缀仅允许字母/数字/短横线/下划线");
-            return DEMO_ERR_INVAL;
-        }
-    }
-    if (strcmp(password, PROTO_PC_AP_PASSWORD) != 0) {
-        snprintf(error, error_capacity, "热点密码必须使用产品固定值");
-        return DEMO_ERR_INVAL;
-    }
-    if (strcmp(ip, PROTO_PC_AP_IP) != 0) {
-        snprintf(error, error_capacity, "PC热点IP必须为 192.168.137.1");
-        return DEMO_ERR_INVAL;
-    }
-    if (port != PROTO_TCP_PORT) {
-        snprintf(error, error_capacity, "TCP端口必须为 5935");
-        return DEMO_ERR_INVAL;
-    }
-    return DEMO_OK;
-}
-
-int device_config_validate(const device_config_t *cfg, char *error, int error_capacity)
-{
-    if (cfg == NULL || error == NULL || error_capacity <= 0)
-        return DEMO_ERR_INVAL;
-    error[0] = '\0';
-
-    if (cfg->wifi_retry_max < 1) {
-        snprintf(error, error_capacity, "WiFi重试次数必须不小于 1");
-        return DEMO_ERR_INVAL;
-    }
-    if (cfg->wifi_backoff_base_ms <= 0) {
-        snprintf(error, error_capacity, "WiFi退避基数必须为正数");
-        return DEMO_ERR_INVAL;
-    }
-    if (cfg->wifi_backoff_cap_ms < cfg->wifi_backoff_base_ms) {
-        snprintf(error, error_capacity, "WiFi退避上限不能小于基数");
-        return DEMO_ERR_INVAL;
-    }
-    if (cfg->wifi_backoff_jitter_ms < 0) {
-        snprintf(error, error_capacity, "WiFi退避抖动不能为负数");
-        return DEMO_ERR_INVAL;
-    }
-    if (cfg->reconnect_backoff_base_ms <= 0) {
-        snprintf(error, error_capacity, "重连退避基数必须为正数");
-        return DEMO_ERR_INVAL;
-    }
-    if (cfg->reconnect_backoff_cap_ms < cfg->reconnect_backoff_base_ms) {
-        snprintf(error, error_capacity, "重连退避上限不能小于基数");
-        return DEMO_ERR_INVAL;
-    }
-    if (cfg->reconnect_backoff_jitter_ms < 0) {
-        snprintf(error, error_capacity, "重连退避抖动不能为负数");
-        return DEMO_ERR_INVAL;
-    }
-    /* SSID/密码/IP/端口与 PC 完全一致（设备无前缀长度字段，固定 24 在 PC 侧校验） */
-    return validate_cross_fields(cfg->pc_ap_ssid, cfg->pc_ap_password,
-                                 cfg->pc_host_ip, cfg->host_tcp_port,
-                                 error, error_capacity);
 }

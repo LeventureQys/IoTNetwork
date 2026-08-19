@@ -77,10 +77,11 @@ int sim_world_mdns_resolve(const sim_world_t *w, const char *type, sim_mdns_svc_
 void sim_world_mcast_set_blocked(sim_world_t *w, const char *tag, int blocked);
 int sim_world_mcast_is_blocked(const sim_world_t *w, const char *tag);
 
-/* 虚拟 IP（网络字节序），beta v1.1 角色反转语义：
- * PC 是热点网关 192.168.137.1；设备 STA 位于 192.168.137.100+。 */
-uint32_t sim_world_pc_ap_ip(void);
+/* 虚拟 IP（网络字节序）与真实端口推导，语义冻结于旧实现 */
+uint32_t sim_world_host_virtual_ip(void);
+uint32_t sim_world_device_ap_virtual_ip(void);
 uint32_t sim_world_device_sta_virtual_ip(int dev_index);
+uint16_t sim_world_device_ap_real_port(int base, int dev_index);
 
 #ifdef __cplusplus
 }

@@ -217,8 +217,8 @@ bool SimWorld::McastIsBlocked(const char *tag) const
     return false;
 }
 
-uint32_t SimWorld::HostVirtualIp()       { return ip_of(PROTO_PC_AP_IP); }
-uint32_t SimWorld::DeviceApVirtualIp()   { return ip_of("192.168.1.1"); }
+uint32_t SimWorld::HostVirtualIp()       { return ip_of("192.168.1.50"); }
+uint32_t SimWorld::DeviceApVirtualIp()   { return ip_of(PROTO_SIM_AP_IP); }
 uint32_t SimWorld::DeviceStaVirtualIp(int dev_index)
 {
     char buf[32];

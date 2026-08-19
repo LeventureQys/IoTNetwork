@@ -31,6 +31,7 @@ struct device_host {
     char sim_catalog_dir[1024];
     char scenario_path[1024];
     char device_id[18];
+    int provision_port;
     uint32_t duration_ms;
     uint64_t start_mono_ms;
 

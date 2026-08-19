@@ -25,6 +25,10 @@ struct SnapshotLogTest : ::testing::Test {
 
 TEST_F(SnapshotLogTest, SnapshotConcurrentReadsConsistent)
 {
+    fake_backend_set_announce(1);
+    PreseedCreds(dir, 0,
+                 "{\"schema\":1,\"creds\":[{\"ssid\":\"TactileFactory-2.4G\","
+                 "\"password\":\"securepass123\",\"confirmed\":1}]}");
     std::string cfg_path;
     device_host_options_t o = MakeOptions(dir, &cfg_path);
     device_host_t *h = CreateHost(o);
@@ -66,24 +70,22 @@ TEST_F(SnapshotLogTest, SnapshotConcurrentReadsConsistent)
     DestroyHost(&h);
 }
 
-TEST_F(SnapshotLogTest, SnapshotTracksScanState)
+TEST_F(SnapshotLogTest, SnapshotTracksProvisionState)
 {
-    fake_backend_set_no_ap(1); /* 无目标 → 停留在 WIFI_SCAN */
     std::string cfg_path;
     device_host_options_t o = MakeOptions(dir, &cfg_path);
     device_host_t *h = CreateHost(o);
     device_error_t e;
     ASSERT_EQ(device_host_start(h, &e), DEVICE_OK);
-    EXPECT_TRUE(WaitDeviceState(h, DEV_STATE_WIFI_SCAN, 10000));
+    EXPECT_TRUE(WaitDeviceState(h, DEV_STATE_AP_PROVISION, 10000));
     device_snapshot_t s;
     ASSERT_EQ(device_host_get_snapshot(h, &s), DEVICE_OK);
-    EXPECT_EQ(s.device_state, DEV_STATE_WIFI_SCAN);
-    EXPECT_STREQ(s.target_ssid, "Modu_PC");
-    EXPECT_STREQ(s.pc_host_ip, "192.168.137.1");
-    EXPECT_EQ(s.pc_host_port, 5935);
+    EXPECT_EQ(s.device_state, DEV_STATE_AP_PROVISION);
+    EXPECT_STREQ(s.ap_ssid, "Modu_0001");
     EXPECT_EQ(s.backend_kind, (int)DEVICE_BACKEND_SIM);
     EXPECT_STREQ(s.backend_name, "sim");
     EXPECT_EQ(s.session_online, 0);
+    EXPECT_NE(s.provision_port, 0);
     EXPECT_EQ(device_host_request_stop(h), DEVICE_OK);
     EXPECT_EQ(device_host_join(h, 5000, &e), DEVICE_OK);
     DestroyHost(&h);
@@ -91,13 +93,12 @@ TEST_F(SnapshotLogTest, SnapshotTracksScanState)
 
 TEST_F(SnapshotLogTest, NoWritesAfterJoin)
 {
-    fake_backend_set_no_ap(1);
     std::string cfg_path;
     device_host_options_t o = MakeOptions(dir, &cfg_path);
     device_host_t *h = CreateHost(o);
     device_error_t e;
     ASSERT_EQ(device_host_start(h, &e), DEVICE_OK);
-    EXPECT_TRUE(WaitDeviceState(h, DEV_STATE_WIFI_SCAN, 10000));
+    EXPECT_TRUE(WaitDeviceState(h, DEV_STATE_AP_PROVISION, 10000));
     EXPECT_EQ(device_host_request_stop(h), DEVICE_OK);
     EXPECT_EQ(device_host_join(h, 5000, &e), DEVICE_OK);
 
@@ -122,13 +123,12 @@ TEST_F(SnapshotLogTest, NoWritesAfterJoin)
 
 TEST_F(SnapshotLogTest, LogsArriveAndDrain)
 {
-    fake_backend_set_no_ap(1);
     std::string cfg_path;
     device_host_options_t o = MakeOptions(dir, &cfg_path);
     device_host_t *h = CreateHost(o);
     device_error_t e;
     ASSERT_EQ(device_host_start(h, &e), DEVICE_OK);
-    EXPECT_TRUE(WaitDeviceState(h, DEV_STATE_WIFI_SCAN, 10000));
+    EXPECT_TRUE(WaitDeviceState(h, DEV_STATE_AP_PROVISION, 10000));
     EXPECT_EQ(device_host_request_stop(h), DEVICE_OK);
     EXPECT_EQ(device_host_join(h, 5000, &e), DEVICE_OK);
     /* 运行期间产生了设备日志 */

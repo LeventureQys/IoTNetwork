@@ -87,8 +87,9 @@ TEST(SimWorld, McastBlock)
 
 TEST(SimWorld, VirtualIps)
 {
-    EXPECT_EQ(SimWorld::HostVirtualIp(), inet_addr(PROTO_PC_AP_IP)); /* 192.168.137.1 */
-    EXPECT_EQ(SimWorld::DeviceApVirtualIp(), inet_addr("192.168.1.1"));
-    EXPECT_EQ(SimWorld::DeviceStaVirtualIp(0), inet_addr("192.168.1.100"));
+    EXPECT_EQ(SimWorld::HostVirtualIp(), 0x3201A8C0);     /* 192.168.1.50 */
+    EXPECT_EQ(SimWorld::DeviceApVirtualIp(), inet_addr(PROTO_SIM_AP_IP));
+    EXPECT_EQ(SimWorld::DeviceApVirtualIp(), 0x0101A8C0); /* 保持原网络序值 */
+    EXPECT_EQ(SimWorld::DeviceStaVirtualIp(0), 0x6401A8C0); /* 192.168.1.100 */
     EXPECT_EQ(SimWorld::DeviceApRealPort(20000, 2), 20002);
 }

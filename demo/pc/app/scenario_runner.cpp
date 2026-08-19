@@ -66,8 +66,9 @@ void PcScenarioRunner::RunAction(const pc_scenario_action_t &action)
 {
     switch (action.kind) {
     case PC_SCENARIO_ACTION_AUTO_PROVISION: {
-        /* beta v1.1：已移除设备配网主路径；该动作保留解析但不再执行 */
-        EmitResult(action, "failed", 0, "auto_provision_removed");
+        host_->SetTargetNetwork(action.arg_ssid, action.arg_password);
+        host_->ProvisionAllDevices();
+        EmitResult(action, "ok", 0, "");
         break;
     }
     case PC_SCENARIO_ACTION_SEND_APP_DATA: {

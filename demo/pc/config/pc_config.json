@@ -1,13 +1,26 @@
 {
   "host_tcp_port": 5935,
-  "pc_ap_ssid": "Modu_PC",
-  "pc_ap_password": "modu_leventure",
-  "pc_ap_ip": "192.168.137.1",
-  "pc_ap_prefix_length": 24,
+  "host_advertise_ip": "127.0.0.1",
+  "mcast_group": "224.0.2.1",
+  "mcast_port": 5936,
+  "limits": {
+    "host_max_conn": 16,
+    "malformed_max_per_conn": 3,
+    "device_rate_limit_per_sec": 50,
+    "app_data_text_bytes": 512
+  },
   "heartbeat_interval_ms": 2000,
-  "heartbeat_dead_ms": 0,
   "hello_timeout_ms": 5000,
-  "malformed_max_per_conn": 3,
-  "device_rate_limit_per_sec": 50,
-  "duration_s": 45
+  "provision_auth_timeout_ms": 3000,
+  "provision_wifi_cfg_timeout_ms": 8000,
+  "discovery_fast_window_ms": 8000,
+  "discovery_normal_interval_ms": 1000,
+  "discovery_candidate_timeout_ms": 6000,
+  "reconnect_backoff_cap_ms": 5000,
+  "busy_backoff_ms": 6000,
+  "target_ssid": "TactileFactory-2.4G",
+  "target_password": "securepass123",
+  "target_band_2g": 1,
+  "duration_s": 45,
+  "config_tag": "demo"
 }

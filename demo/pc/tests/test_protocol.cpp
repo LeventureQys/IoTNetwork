@@ -2,50 +2,35 @@
 #include <cstring>
 #include "protocol.h"
 
-TEST(Protocol, Constants)
-{
-    EXPECT_EQ(PROTO_VERSION, 1);
-    EXPECT_EQ(PROTO_MSG_MAX_LEN, 1024);
-    EXPECT_EQ(PROTO_FRAME_HEAD_LEN, 2);
-    EXPECT_EQ(PROTO_TCP_PORT, 5935);
-    EXPECT_STREQ(PROTO_PC_AP_IP, "192.168.137.1");
-    EXPECT_STREQ(PROTO_PC_AP_PREFIX, "Modu_");
-    EXPECT_STREQ(PROTO_PC_AP_DEFAULT_SSID, "Modu_PC");
-    EXPECT_STREQ(PROTO_PC_AP_PASSWORD, "modu_leventure");
-    EXPECT_EQ(PROTO_HOST_MAX_CONN, 1);
-    EXPECT_EQ(PROTO_SESSION_ID_LEN, 8);
-    EXPECT_EQ(APP_DATA_TEXT_MAX, 512);
-}
-
 TEST(Protocol, StateStr)
 {
     EXPECT_STREQ(device_state_str(DEV_STATE_BOOT), "boot");
-    EXPECT_STREQ(device_state_str(DEV_STATE_WIFI_SCAN), "wifi_scan");
     EXPECT_STREQ(device_state_str(DEV_STATE_STA_JOIN), "sta_join");
+    EXPECT_STREQ(device_state_str(DEV_STATE_AP_PROVISION), "ap_provision");
+    EXPECT_STREQ(device_state_str(DEV_STATE_DISCOVERY), "discovery");
     EXPECT_STREQ(device_state_str(DEV_STATE_CONNECT), "connect");
     EXPECT_STREQ(device_state_str(DEV_STATE_SESSION), "session");
     EXPECT_STREQ(device_state_str(DEV_STATE_HEAL), "heal");
     EXPECT_STREQ(device_state_str((device_state_t)999), "unknown");
 }
 
-TEST(Protocol, StateEnumValues)
-{
-    EXPECT_EQ(DEV_STATE_BOOT, 0);
-    EXPECT_EQ(DEV_STATE_WIFI_SCAN, 1);
-    EXPECT_EQ(DEV_STATE_STA_JOIN, 2);
-    EXPECT_EQ(DEV_STATE_CONNECT, 3);
-    EXPECT_EQ(DEV_STATE_SESSION, 4);
-    EXPECT_EQ(DEV_STATE_HEAL, 5);
-    EXPECT_EQ(DEV_STATE_COUNT, 6);
-}
-
 TEST(Protocol, CommandNames)
 {
-    /* beta v1.1：仅保留握手/心跳/应用数据 5 条命令 */
+    /* 13 种标准命令与协议文档 2.4 命令空间一致 */
+    EXPECT_STREQ(CMD_AUTH, "auth");
+    EXPECT_STREQ(CMD_AUTH_RESULT, "auth_result");
+    EXPECT_STREQ(CMD_WIFI_CONFIG, "wifi_config");
+    EXPECT_STREQ(CMD_WIFI_RESULT, "wifi_result");
+    EXPECT_STREQ(CMD_CLOSE_AP, "close_ap");
+    EXPECT_STREQ(CMD_HOST_ANNOUNCE, "host_announce");
+    EXPECT_STREQ(CMD_HOST_BYE, "host_bye");
     EXPECT_STREQ(CMD_DEVICE_HELLO, "device_hello");
     EXPECT_STREQ(CMD_HOST_ACK, "host_ack");
     EXPECT_STREQ(CMD_PING, "ping");
     EXPECT_STREQ(CMD_PONG, "pong");
+    EXPECT_STREQ(CMD_DIAG_QUERY, "diag_query");
+    EXPECT_STREQ(CMD_DIAG_REPORT, "diag_report");
+    /* 通用业务占位 */
     EXPECT_STREQ(CMD_APP_DATA, "app_data");
 }
 

@@ -14,7 +14,7 @@ TactileSense 下位机设备模拟器。本目录完全自包含：构建、源�
 | `src/common/` | 设备公共 C：frame/log/net_abstraction/protocol |
 | `src/config/` | CLI 解析（host_options）、配置加载、路径解析 |
 | `src/runtime/` | 生命周期/线程/命令与日志队列/事件写入器/scenario 引擎/facade 实现 |
-| `src/core/` | 设备业务状态机（boot→wifi_scan→sta_join→connect→session→heal） |
+| `src/core/` | 设备业务状态机（boot→sta→ap→discovery→connect→session→heal） |
 | `src/platform/{win32,posix}/` | 纯 C 平台适配（线程/锁/单调时钟） |
 | `backends/sim/` | 纯 C 模拟后端（WiFi/AP/TCP/NVS/catalog/fault） |
 | `backends/linux/` | Linux 真实热点/STA 后端（非 Linux 平台为 NOT_SUPPORTED stub） |
@@ -62,21 +62,14 @@ CLI：`--config`、`--device-index`(0~15)、`--fresh`、`--duration`、
 `--runtime-dir`、`--sim-catalog-dir`、`--log-dir`、`--events-jsonl`、`--scenario`。
 不传测试参数时无测试通道。相对路径按启动 CWD 解析；配置内相对路径按配置文件目录解析。
 
-> beta v1.1 拓扑：设备只做 STA——扫描 `pc_ap_ssid`（默认 `Modu_PC`）→ 用固定密码
-> `modu_leventure` 连接 → 直连 `pc_host_ip:host_tcp_port`（`192.168.137.1:5935`）。
-> 设备不创建热点、不参与配网/服务发现；真实 Linux 后端（`--backend linux`）纯 STA，
-> 普通用户无需 root（仅需 nmcli/网卡权限）。Linux 真实环境验收需 nmcli + 无线网卡 +
-> PC 热点，本仓库 Windows 开发机无法执行（见 `Document/Update/beta v1.1/阶段三问题清单.md`
-> CQ4，阻塞项）。sim 双进程场景 A~H 见 `../integration_tests/README.md`。
-> ESP32-C2 后端/固件不在 beta v1.1 开发与验收范围。
-
 ## Scenario（`--scenario`，仅 sim 后端）
 
 文件 schema 见设计文档第 11 节：`{"schema":1,"actions":[{"id","target",
 "after_event","delay_ms","action","args"}]}`。action 一次一结果（`scenario_result`
-事件）；`after_event` 门控（ready/session_online/session_offline/null）；
-`delay_ms` 0~60000。支持 `send_app_data`（>512 字节 → `rejected/payload_too_large`）、
-`inject_fault`、`request_stop`。
+事件）；`after_event` 门控（ready/ap_ready/session_online/session_offline/null）；
+`delay_ms` 0~60000。支持 `auto_provision`（连接本机配网服务完成 auth+wifi_config）、
+`send_app_data`（>512 字节 → `rejected/payload_too_large`）、`inject_fault`、
+`request_stop`。`auto_provision` 需配网 AP 已就绪（建议 `after_event=ap_ready`）。
 
 ## 协议产物与安装
 

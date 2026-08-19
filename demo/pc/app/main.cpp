@@ -1,6 +1,7 @@
-#include "host_app.h"
+﻿#include "host_app.h"
 #include "host_window.h"
 #include "sim_backend.h"
+#include "sim_world.h"
 #include "win_backend.h"
 #include "log.h"
 #include "params.h"
@@ -39,6 +40,7 @@ struct CliOptions {
     const char *log_dir = nullptr;
     const char *events_jsonl = nullptr;
     const char *scenario = nullptr;
+    bool auto_provision = false;
     int duration = 0;
     int backend = -1; /* 0=sim 1=windows；-1=平台默认 */
 };
@@ -73,6 +75,8 @@ int parse_cli(int argc, char **argv, CliOptions *opts)
             opts->events_jsonl = argv[++i];
         else if (strcmp(argv[i], "--scenario") == 0 && i + 1 < argc)
             opts->scenario = argv[++i];
+        else if (strcmp(argv[i], "--auto-provision") == 0)
+            opts->auto_provision = true;
         else if (strcmp(argv[i], "--duration") == 0 && i + 1 < argc)
             opts->duration = atoi(argv[++i]);
         else if (strcmp(argv[i], "--sim") == 0)
@@ -146,7 +150,7 @@ int main(int argc, char **argv)
     if (parse_cli(argc, argv, &opts) != 0) {
         fprintf(stderr,
                 "用法: provision_pc [--config <path>] [--backend sim|windows|--sim] "
-                "[--duration <sec>] [--runtime-dir <dir>] "
+                "[--auto-provision] [--duration <sec>] [--runtime-dir <dir>] "
                 "[--sim-catalog-dir <dir>] [--log-dir <dir>] [--events-jsonl <path>] "
                 "[--scenario <path>]\n");
         return 1;
@@ -157,7 +161,7 @@ int main(int argc, char **argv)
 #else
     int backend_kind = opts.backend >= 0 ? opts.backend : 0; /* Linux 默认 sim */
     if (backend_kind == 1) {
-        fprintf(stderr, "警告：Linux 下真实 WiFi 后端不可用，已回退到模拟模式（--sim）\n");
+        fprintf(stderr, "警告：Linux 下真实 WiFi 配网后端不可用，已回退到模拟模式（--sim）\n");
         backend_kind = 0;
     }
 #endif
@@ -223,15 +227,6 @@ int main(int argc, char **argv)
     }
     if (config_missing)
         config_path = nullptr;
-
-    /* 配置校验：非法配置启动失败（退出码 1），不创建热点/TCP */
-    {
-        char validate_error[256];
-        if (params_validate(&params, validate_error, sizeof(validate_error)) != DEMO_OK) {
-            fprintf(stderr, "配置非法：%s\n", validate_error);
-            return 1;
-        }
-    }
 
     /* 配置内相对路径以配置目录解析 */
     char cfg_dir[520] = {0};
@@ -328,12 +323,15 @@ int main(int argc, char **argv)
     else
         LOG_W("MAIN", "配置文件缺失，使用内置默认参数");
 
-    /* 后端创建（无任意局域网 IP 获取，无配网路径） */
     void *backend = nullptr;
     const net_backend_t *table = nullptr;
+    bool real_wifi = false;
     if (backend_kind == 0) {
+        snprintf(params.host_virtual_ip, sizeof(params.host_virtual_ip), "127.0.0.1");
         snprintf(params.runtime_dir, sizeof(params.runtime_dir), "%s", runtime_dir);
         snprintf(params.sim_catalog_dir, sizeof(params.sim_catalog_dir), "%s", catalog_dir);
+        SimWorld::Instance().TargetNetworkSet(params.target_ssid, params.target_password,
+                                              params.target_band_2g != 0);
         backend = sim_backend_create("host", &params);
         table = sim_backend_table();
         if (!backend) {
@@ -341,6 +339,12 @@ int main(int argc, char **argv)
             return 2;
         }
     } else {
+        real_wifi = true;
+        if (win_backend_get_ipv4(params.host_virtual_ip,
+                                 (int)sizeof(params.host_virtual_ip)) != DEMO_OK) {
+            emit_error("backend", "无法获取 PC 当前局域网 IPv4 地址");
+            return 2;
+        }
         backend = win_backend_create(&params);
         table = win_backend_table();
         if (!backend) {
@@ -360,19 +364,19 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    HostApp *host = new HostApp(params, net);
+    HostApp *host = new HostApp(params, net, opts.auto_provision, real_wifi);
     if (host->Start() != DEMO_OK) {
-        LOG_E("MAIN", "上位机启动失败（热点或 TCP 端口异常）");
-        emit_error("host_start", "上位机启动失败（热点或 TCP 端口异常）");
+        LOG_E("MAIN", "上位机启动失败，请检查端口是否被占用");
+        emit_error("host_start", "上位机启动失败，请检查端口是否被占用");
         delete host;
         net_ctx_destroy(net);
         if (backend_kind == 0) sim_backend_destroy(backend); else win_backend_destroy(backend);
         return 2;
     }
     LOG_I("MAIN", "运行模式：%s", backend_kind == 0 ? "模拟" : "Windows真实");
-    LOG_I("MAIN", "热点：SSID=%s，IP=%s/%d，TCP=0.0.0.0:%d",
-          params.pc_ap_ssid, params.pc_ap_ip, params.pc_ap_prefix_length,
-          params.host_tcp_port);
+    LOG_I("MAIN", "TCP监听端点：0.0.0.0:%d", params.host_tcp_port);
+    LOG_I("MAIN", "服务通告端点：%s:%d", params.host_virtual_ip, params.host_tcp_port);
+    LOG_I("MAIN", "组播端点：%s:%d", params.mcast_group, params.mcast_port);
 
     {
         char data[128];
@@ -388,6 +392,7 @@ int main(int argc, char **argv)
     }
 
     std::thread host_thread([host] { host->Run(); });
+    std::atomic<bool> provisioning{false};
 
     PcScenarioRunner scenario_runner(host, net, &scenario);
     std::thread scenario_thread;
@@ -397,10 +402,29 @@ int main(int argc, char **argv)
     int result = 0;
     {
         QApplication app(argc, argv);
-        HostWindow window(host);
+        HostWindow window(host, params.target_ssid, params.target_password, [&]() {
+            if (provisioning.exchange(true))
+                return;
+            std::thread([&]() {
+                host->ProvisionAllDevices();
+                provisioning = false;
+            }).detach();
+        });
+        if (opts.auto_provision) {
+            QTimer::singleShot(1800, &window, [&]() {
+                if (!provisioning.exchange(true)) {
+                    std::thread([&]() {
+                        host->ProvisionAllDevices();
+                        provisioning = false;
+                    }).detach();
+                }
+            });
+        }
         if (params.duration_s > 0)
             QTimer::singleShot(params.duration_s * 1000, &window, &QWidget::close);
         QObject::connect(&window, &HostWindow::StopRequested, [&]() {
+            while (provisioning)
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
             host->RequestStop();
             app.quit();
         });

@@ -4,7 +4,6 @@
 #include <chrono>
 #include <filesystem>
 #include <string>
-#include <functional>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
@@ -17,14 +16,8 @@
 #include "protocol.h"
 #include "common.h"
 #include "sim_world.h"
-#include "sim_ap_catalog.h"
 
 namespace {
-
-/* mDNS/组播为 v1.1 之前的服务发现通道，vtable 仍保留；协议常量已裁剪，
- * 此处使用与旧值一致的本地字面量。 */
-static const char *kMcastGroup = "224.0.2.1";
-static const uint16_t kMcastPort = 5936;
 
 std::string MakeTempDir(const char *prefix)
 {
@@ -36,7 +29,7 @@ std::string MakeTempDir(const char *prefix)
     return dir.string();
 }
 
-void CreateBackend(const char *nvs, const char *catalog, unsigned idx,
+void CreateBackend(const char *nvs, const char *catalog, unsigned idx, unsigned port,
                    device_backend_instance_t *out)
 {
     device_sim_backend_options_t o;
@@ -44,29 +37,14 @@ void CreateBackend(const char *nvs, const char *catalog, unsigned idx,
     o.config_path = "unused";
     o.nvs_file = nvs;
     o.sim_catalog_dir = catalog;
+    o.target_ssid = "TactileFactory-2.4G";
+    o.target_password = "modutech_leventure";
+    o.host_virtual_ip = "192.168.1.50";
     o.device_index = idx;
+    o.provision_port = port;
     o.random_seed = 12345u + idx * 7919u;
     device_error_t err;
     ASSERT_EQ(device_sim_backend_create(&o, out, &err), DEVICE_OK);
-}
-
-void WriteHotspot(const std::string &catalog, const char *ssid, const char *password,
-                  unsigned loopback_port)
-{
-    std::filesystem::create_directories(catalog);
-    char buf[1024];
-    snprintf(buf, sizeof(buf),
-             "{\"schema\":2,\"ssid\":\"%s\",\"password\":\"%s\","
-             "\"logical_gateway\":\"192.168.137.1\",\"prefix_length\":24,"
-             "\"tcp_port\":5935,\"loopback_host\":\"127.0.0.1\","
-             "\"loopback_port\":%u,\"published_at_ms\":%llu,\"owner_pid\":%lu}",
-             ssid, password, loopback_port,
-             (unsigned long long)sim_ap_catalog_wallclock_ms(),
-             sim_ap_catalog_current_pid());
-    FILE *fp = fopen((catalog + "/pc-hotspot.json").c_str(), "wb");
-    ASSERT_NE(fp, nullptr);
-    fputs(buf, fp);
-    fclose(fp);
 }
 
 struct BackendPair {
@@ -81,8 +59,8 @@ struct BackendPair {
         catalog = root + "/catalog";
         std::string nvs_a = root + "/a.nvs.json";
         std::string nvs_b = root + "/b.nvs.json";
-        CreateBackend(nvs_a.c_str(), catalog.c_str(), 0, &a);
-        CreateBackend(nvs_b.c_str(), catalog.c_str(), 1, &b);
+        CreateBackend(nvs_a.c_str(), catalog.c_str(), 0, 21000, &a);
+        CreateBackend(nvs_b.c_str(), catalog.c_str(), 1, 21001, &b);
     }
 
     void TearDown()
@@ -132,17 +110,39 @@ TEST(SimSocket, LoopbackTcp)
     bp.TearDown();
 }
 
-TEST(SimSocket, PcApAddrTranslation)
+TEST(SimSocket, VirtualAddrTranslation)
 {
     BackendPair bp;
     bp.SetUp();
-    /* PC 发布：loopback_port=21000，a 在 21000 监听 */
-    WriteHotspot(bp.catalog, "Modu_PC", "modu_leventure", 21000);
+    /* A 开 AP（模拟 PROTO_SIM_AP_IP:5935 ↔ 真实 21000，经 catalog 发布） */
+    ASSERT_EQ(bp.a.vtable->wifi_ap_start(bp.a.user, "Modu_0001", "pass123456", "1234"), DEMO_OK);
     void *listen = nullptr;
     ASSERT_EQ(bp.a.vtable->tcp_listen(bp.a.user, 21000, &listen), DEMO_OK);
-    /* b 连接 192.168.137.1:5935 → 翻译到 127.0.0.1:21000 */
+    /* B 连接模拟 AP 地址 → 应翻译到 127.0.0.1:21000 */
     net_addr_t vaddr;
-    vaddr.ip = inet_addr(PROTO_PC_AP_IP);
+    vaddr.ip = inet_addr(PROTO_SIM_AP_IP);
+    vaddr.port = htons(PROTO_TCP_PORT);
+    void *conn = nullptr;
+    ASSERT_EQ(bp.b.vtable->tcp_connect(bp.b.user, &vaddr, &conn, 2000), DEMO_OK);
+    void *accepted = nullptr;
+    int rc = WaitForOk([&]() { return bp.a.vtable->tcp_accept(bp.a.user, listen, &accepted, nullptr); });
+    ASSERT_EQ(rc, DEMO_OK);
+    bp.b.vtable->sock_close(bp.b.user, conn);
+    bp.a.vtable->sock_close(bp.a.user, accepted);
+    bp.a.vtable->sock_close(bp.a.user, listen);
+    ASSERT_EQ(bp.a.vtable->wifi_ap_stop(bp.a.user), DEMO_OK);
+    bp.TearDown();
+}
+
+TEST(SimSocket, HostVirtualAddrConnect)
+{
+    BackendPair bp;
+    bp.SetUp();
+    /* host 业务端口监听（host 在虚拟 IP 192.168.1.50）→ 翻译到 loopback:5935 */
+    void *listen = nullptr;
+    ASSERT_EQ(bp.a.vtable->tcp_listen(bp.a.user, PROTO_TCP_PORT, &listen), DEMO_OK);
+    net_addr_t vaddr;
+    vaddr.ip = sim_world_host_virtual_ip();
     vaddr.port = htons(PROTO_TCP_PORT);
     void *conn = nullptr;
     ASSERT_EQ(bp.b.vtable->tcp_connect(bp.b.user, &vaddr, &conn, 2000), DEMO_OK);
@@ -160,10 +160,10 @@ TEST(SimSocket, MulticastBetweenInstances)
     BackendPair bp;
     bp.SetUp();
     void *hs = nullptr, *ds = nullptr;
-    ASSERT_EQ(bp.a.vtable->udp_mcast_join(bp.a.user, kMcastGroup, kMcastPort, &hs), DEMO_OK);
-    ASSERT_EQ(bp.b.vtable->udp_mcast_join(bp.b.user, kMcastGroup, kMcastPort, &ds), DEMO_OK);
+    ASSERT_EQ(bp.a.vtable->udp_mcast_join(bp.a.user, PROTO_MCAST_GROUP, PROTO_MCAST_PORT, &hs), DEMO_OK);
+    ASSERT_EQ(bp.b.vtable->udp_mcast_join(bp.b.user, PROTO_MCAST_GROUP, PROTO_MCAST_PORT, &ds), DEMO_OK);
     const char *announce = "{\"cmd\":\"host_announce\"}";
-    ASSERT_EQ(bp.a.vtable->udp_send(bp.a.user, kMcastGroup, kMcastPort,
+    ASSERT_EQ(bp.a.vtable->udp_send(bp.a.user, PROTO_MCAST_GROUP, PROTO_MCAST_PORT,
                                     (const uint8_t *)announce, (int)strlen(announce)),
               (int)strlen(announce));
     uint8_t buf[256];
@@ -181,8 +181,8 @@ TEST(SimSocket, NonBlockingRecv)
     BackendPair bp;
     bp.SetUp();
     void *hs = nullptr, *ds = nullptr;
-    ASSERT_EQ(bp.a.vtable->udp_mcast_join(bp.a.user, kMcastGroup, kMcastPort, &hs), DEMO_OK);
-    ASSERT_EQ(bp.b.vtable->udp_mcast_join(bp.b.user, kMcastGroup, kMcastPort, &ds), DEMO_OK);
+    ASSERT_EQ(bp.a.vtable->udp_mcast_join(bp.a.user, PROTO_MCAST_GROUP, PROTO_MCAST_PORT, &hs), DEMO_OK);
+    ASSERT_EQ(bp.b.vtable->udp_mcast_join(bp.b.user, PROTO_MCAST_GROUP, PROTO_MCAST_PORT, &ds), DEMO_OK);
     uint8_t buf[64];
     EXPECT_EQ(bp.b.vtable->udp_recv(bp.b.user, ds, buf, sizeof(buf), nullptr), DEMO_ERR_AGAIN);
     bp.a.vtable->sock_close(bp.a.user, hs);

@@ -31,6 +31,8 @@ struct CoreFixture {
         device_sim_backend_options_t opts;
         memset(&opts, 0, sizeof(opts));
         opts.nvs_file = "run/dev_logic2.nvs.json";
+        opts.target_ssid = cfg.target_ssid;
+        opts.target_password = cfg.target_password;
         device_error_t e;
         ASSERT_EQ(device_sim_backend_create(&opts, &inst, &e), DEVICE_OK);
         ASSERT_EQ(net_ctx_create(inst.vtable, inst.user, nullptr, &ctx), DEMO_OK);

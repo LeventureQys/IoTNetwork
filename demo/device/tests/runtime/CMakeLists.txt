@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+﻿cmake_minimum_required(VERSION 3.20)
 project(device_ss03_runtime_tests LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
@@ -45,6 +45,8 @@ add_library(device_ss03_prod STATIC
     ${DEVICE_SRC_DIR}/core/device_app.c
     ${DEVICE_SRC_DIR}/core/device_eventlog.c
     ${DEVICE_SRC_DIR}/core/device_limits.c
+    ${DEVICE_SRC_DIR}/core/device_provision.c
+    ${DEVICE_SRC_DIR}/core/device_discovery.c
     ${DEVICE_SRC_DIR}/core/device_session.c
     ${DEVICE_SRC_DIR}/core/device_heal.c
     ${DEVICE_PLATFORM_SRC}

@@ -20,11 +20,12 @@ QString StateName(int state)
 {
     switch (state) {
     case 0: return QStringLiteral("启动");
-    case 1: return QStringLiteral("扫描PC热点");
-    case 2: return QStringLiteral("连接热点");
-    case 3: return QStringLiteral("连接PC");
-    case 4: return QStringLiteral("会话在线");
-    case 5: return QStringLiteral("异常重连");
+    case 1: return QStringLiteral("连接目标 WiFi");
+    case 2: return QStringLiteral("等待上位机配网");
+    case 3: return QStringLiteral("发现上位机");
+    case 4: return QStringLiteral("连接上位机");
+    case 5: return QStringLiteral("会话在线");
+    case 6: return QStringLiteral("异常自愈");
     default: return QStringLiteral("未知");
     }
 }
@@ -41,7 +42,7 @@ DeviceWindow::DeviceWindow(device_host_t *host, QWidget *parent)
     flow_widget_ = new FlowWidget(this);
 
     state_label_ = new QLabel(this);
-    target_label_ = new QLabel(this);
+    ap_label_ = new QLabel(this);
     session_label_ = new QLabel(this);
     error_label_ = new QLabel(this);
     error_label_->setObjectName(QStringLiteral("error_label"));
@@ -51,7 +52,7 @@ DeviceWindow::DeviceWindow(device_host_t *host, QWidget *parent)
 
     QFormLayout *status = new QFormLayout;
     status->addRow(QStringLiteral("当前状态："), state_label_);
-    status->addRow(QStringLiteral("目标："), target_label_);
+    status->addRow(QStringLiteral("配网热点："), ap_label_);
     status->addRow(QStringLiteral("运行信息："), session_label_);
     status->addRow(QStringLiteral("错误："), error_label_);
 
@@ -66,6 +67,8 @@ DeviceWindow::DeviceWindow(device_host_t *host, QWidget *parent)
     action_box_->addItem(QStringLiteral("恢复目标 WiFi"), QStringLiteral("wifi_ok"));
     action_box_->addItem(QStringLiteral("WiFi 认证失败"), QStringLiteral("wifi_auth_fail"));
     action_box_->addItem(QStringLiteral("设置 RSSI"), QStringLiteral("rssi_set"));
+    action_box_->addItem(QStringLiteral("屏蔽组播"), QStringLiteral("mcast_block"));
+    action_box_->addItem(QStringLiteral("恢复组播"), QStringLiteral("mcast_unblock"));
     action_box_->addItem(QStringLiteral("突发发送"), QStringLiteral("burst_send"));
     argument_edit_ = new QLineEdit(this);
     argument_edit_->setObjectName(QStringLiteral("argument_edit"));
@@ -138,11 +141,11 @@ void DeviceWindow::Refresh()
     }
     error_label_->setVisible(false);
     state_label_->setText(StateName(snap.device_state));
-    target_label_->setText(
-        QStringLiteral("SSID=%1，PC=%2:%3")
-            .arg(QString::fromUtf8(snap.target_ssid),
-                 QString::fromUtf8(snap.pc_host_ip))
-            .arg(snap.pc_host_port));
+    ap_label_->setText(QStringLiteral("SSID=%1，密码=%2，PIN=%3，端口=%4")
+                           .arg(QString::fromUtf8(snap.ap_ssid),
+                                QString::fromUtf8(snap.ap_password),
+                                QString::fromUtf8(snap.provision_pin))
+                           .arg(snap.provision_port));
     session_label_->setText(
         QStringLiteral("RSSI=%1 dBm，运行=%2 秒，后端=%3")
             .arg(snap.rssi_dbm)

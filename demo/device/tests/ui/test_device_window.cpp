@@ -32,14 +32,15 @@ private slots:
         device_snapshot_t snap;
         memset(&snap, 0, sizeof(snap));
         snap.host_state = DEVICE_HOST_RUNNING;
-        snap.device_state = 4; /* SESSION */
+        snap.device_state = 5; /* SESSION */
         snap.rssi_dbm = -63;
         snap.uptime_seconds = 120;
+        snap.provision_port = 20007;
         snap.session_online = 1;
         snprintf(snap.device_id, sizeof(snap.device_id), "02:00:00:00:00:08");
-        snprintf(snap.target_ssid, sizeof(snap.target_ssid), "Modu_PC");
-        snprintf(snap.pc_host_ip, sizeof(snap.pc_host_ip), "192.168.137.1");
-        snap.pc_host_port = 5935;
+        snprintf(snap.ap_ssid, sizeof(snap.ap_ssid), "Modu_0008");
+        snprintf(snap.ap_password, sizeof(snap.ap_password), "modutech_leventure");
+        snprintf(snap.provision_pin, sizeof(snap.provision_pin), "5935");
         snprintf(snap.backend_name, sizeof(snap.backend_name), "sim");
         fake_host_set_snapshot(&snap);
 
@@ -47,61 +48,19 @@ private slots:
         window.show();
         QMetaObject::invokeMethod(&window, "Refresh", Qt::DirectConnection);
 
-        bool foundState = false, foundTarget = false, foundSession = false;
+        bool foundState = false, foundAp = false, foundSession = false;
         for (auto *label : window.findChildren<QLabel *>()) {
             if (label->text().contains(QStringLiteral("会话在线")))
                 foundState = true;
-            if (label->text().contains(QStringLiteral("Modu_PC")) &&
-                label->text().contains(QStringLiteral("192.168.137.1")))
-                foundTarget = true;
+            if (label->text().contains(QStringLiteral("Modu_0008")))
+                foundAp = true;
             if (label->text().contains(QStringLiteral("-63")) &&
                 label->text().contains(QStringLiteral("120")))
                 foundSession = true;
         }
         QVERIFY(foundState);
-        QVERIFY(foundTarget);
+        QVERIFY(foundAp);
         QVERIFY(foundSession);
-    }
-
-    /* 六节点 + 无旧配网/发现/AP 文案（任务书第 9 节用例 12） */
-    void sixNodesNoLegacyText()
-    {
-        device_snapshot_t snap;
-        memset(&snap, 0, sizeof(snap));
-        snap.host_state = DEVICE_HOST_RUNNING;
-        snap.device_state = 1; /* WIFI_SCAN */
-        snprintf(snap.device_id, sizeof(snap.device_id), "02:00:00:00:00:01");
-        snprintf(snap.target_ssid, sizeof(snap.target_ssid), "Modu_PC");
-        snprintf(snap.pc_host_ip, sizeof(snap.pc_host_ip), "192.168.137.1");
-        snap.pc_host_port = 5935;
-        fake_host_set_snapshot(&snap);
-
-        DeviceWindow window(fake_host_instance());
-        window.show();
-        QMetaObject::invokeMethod(&window, "Refresh", Qt::DirectConnection);
-
-        bool foundOldText = false;
-        const QString kNodes[6] = {
-            QStringLiteral("启动"), QStringLiteral("扫描PC热点"),
-            QStringLiteral("连接热点"), QStringLiteral("连接PC"),
-            QStringLiteral("会话在线"), QStringLiteral("异常重连")
-        };
-        bool nodeFound[6] = {false, false, false, false, false, false};
-        for (auto *label : window.findChildren<QLabel *>()) {
-            const QString t = label->text();
-            if (t.contains(QStringLiteral("配网")) ||
-                t.contains(QStringLiteral("发现")) ||
-                t.contains(QStringLiteral("密码")) ||
-                t.contains(QStringLiteral("PIN")))
-                foundOldText = true;
-            for (int i = 0; i < 6; i++) {
-                if (t == kNodes[i])
-                    nodeFound[i] = true;
-            }
-        }
-        for (int i = 0; i < 6; i++)
-            QVERIFY(nodeFound[i]); /* 六节点逐一出现（FlowWidget） */
-        QVERIFY(!foundOldText);
     }
 
     void logDrainPushesToModel()

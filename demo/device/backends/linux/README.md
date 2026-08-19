@@ -1,4 +1,4 @@
-# backends/linux：设备真实 Linux STA 后端（纯 C，beta v1.1 纯 STA 拓扑）
+# backends/linux：设备真实 Linux 热点 / STA 后端（纯 C）
 
 > **状态：纯 C，实例化；仅在 Linux 上编译真实实现。非 Linux 平台只提供
 > `device_linux_backend_create` 的 NOT_SUPPORTED stub（`device_backend_linux_unavailable`），
@@ -53,23 +53,10 @@ CMake 目标（供 SS06 聚合）：
 
 ## 4. 配置
 
-beta v1.1 起后端为**纯 STA**（不再创建需要 root 的 hostapd/dnsmasq 热点实例）：
-
-- `demo/device/config/device_linux.json`：标准 v1.1 设备字段（`pc_ap_ssid` 默认 `Modu_PC`、
-  `pc_ap_password` 固定 `modu_leventure`、`pc_host_ip` 固定 `192.168.137.1`、
-  `host_tcp_port` 固定 5935、`use_real_wifi_sta=1`）——与 sim 配置共用同一套
-  `device_config_t` 加载/校验；文件缺失使用内置默认值并告警。
-- Linux 后端附加字段（`linux_backend_config_load` 从同一 JSON 读取，均可省略）：
-  - `enable`：默认 1；为 0 时后端拒绝启动（`DEVICE_ERR_BACKEND_UNAVAILABLE`）。
-  - `sta_interface`：默认空（自动探测）；指定则作为 STA 网卡名传入
-    `linux_wifi_create`。
-  - `nvs_file`：文件 NVS 路径（默认由后端内部决定）。
-- `demo/device/config/linux_hotspot.json`：**v1.1 后端不再加载**（热点实例已从
-  `device_linux_backend_create` 移除）；该文件与 `linux_hotspot*` 源码仅供历史/独立
-  模块测试保留，普通用户运行 `--backend linux` 不要求 root、不启动热点。
-
-> 注意：旧版 README 提到的 `hotspot_config_path` 字段已随 v1.1 移除热点创建而删除，
-> 任何文档/配置均不得再引用该字段。
+- `demo/device/config/device_linux.json`：Linux 专用字段（`enable` / `sta_interface` /
+  `hotspot_config_path` / `nvs_file`），协议字段与 golden 一致；文件缺失使用内置默认值并告警。
+- `demo/device/config/linux_hotspot.json`：迁移自 `demo/config/linux_hotspot.json`，
+  内容与字段语义不变。
 
 ## 5. 依赖与集成注意
 
@@ -80,10 +67,7 @@ beta v1.1 起后端为**纯 STA**（不再创建需要 root 的 hostapd/dnsmasq 
   翻译单元（`device_result_t` 枚举重复定义）；集成时由 SS06/SS08 保证边界。
 - mDNS 三接口（register/unregister/resolve）未实现，显式返回 `DEMO_ERR`（fail-closed）；
   `inject` 返回 `DEMO_ERR`（仅 sim 后端提供）。
-- v1.1 后端 vtable 的 `wifi_ap_start/stop` 返回 `DEMO_ERR`（设备不创建热点；
-  状态机不调用热点/`tcp_listen`/mDNS/UDP）。
-- 真实 STA 验收（nmcli 连接 PC 热点、DHCP、直连 `192.168.137.1:5935`）需 Linux 环境 +
-  无线网卡 + PC 热点，本仓库 Windows 开发机无法执行（见阶段三问题清单 CQ4）。
+- 真实热点验收（root + hostapd/dnsmasq + 支持 AP 的网卡）单独执行，不属于普通 CI。
 
 ## 6. 测试
 

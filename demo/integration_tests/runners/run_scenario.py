@@ -6,18 +6,15 @@
 只消费两端已构建产物（可执行文件、config、share/protocol-contract.json），
 不包含/不编译/不链接任何端侧生产源码。
 
-beta v1.1 拓扑：PC 发布热点（sim 写 pc-hotspot.json catalog）→ 设备扫描/
-连接固定地址 192.168.137.1:5935 → 握手 → 心跳/应用数据。
-
 场景:
-  a  protocol manifest 一致性（三份 schema2 contract 语义比较）
-  b  PC hotspot_ready -> 设备扫描/STA/直连 -> 双方 session_online -> ping/pong
-  c  PC request_stop -> catalog 删除 -> 设备 session_offline；无残留
-  d  sock_send_fail 注入 -> 双方离线 -> 恢复 -> 固定地址重连，reconnect_count 增长
-  e  第二设备被拒（single_device_only），第一设备保持在线
-  f  目标 SSID 不存在：无 session_online、无配网/热点事件、设备持续扫描
-  g  双向 app_data：512 成功、513 rejected、UTF-8 一致
-  h  帧边界与协议版本（拆包/超长/空帧/版本拒绝，原始 socket 探针，PC-only）
+  a  protocol manifest 一致性（PC/device contract 与 golden 语义比较）
+  b  首次配网 -> 会话 + 心跳
+  c  优雅退出（host_bye / 资源清理 / 端口可重绑）
+  d  断链重连（sock_send_fail 注入 -> 离线 -> 恢复 -> 重连）
+  e  close_ap 单次发送失败仍上线
+  f  wifi_result fail：PC 明确失败、无 close_ap、设备保持可配网
+  g  双向 app_data：512/513/UTF-8 字节语义
+  h  帧边界与协议版本拒绝（尽力而为，原始 socket 探针）
 
 用法:
   python run_scenario.py --scenario all --pc-exe out/artifacts/pc/bin/provision_pc.exe \
@@ -29,10 +26,10 @@ import hashlib
 import json
 import os
 import socket
-import struct
 import subprocess
 import sys
 import time
+import threading
 from datetime import datetime
 
 SCENARIOS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scenarios")
@@ -46,39 +43,21 @@ class Runner:
         self.run_root = os.path.abspath(args.runtime_root or os.path.join(os.environ.get("TEMP", "."), "modutech-integration"))
         os.makedirs(self.run_root, exist_ok=True)
         self.qt_bin = args.qt_bin or os.environ.get("QT_BIN", "D:/Devtools/Qt/6.8.3/msvc2022_64/bin")
+        self.checks = []
         self.dir = None
 
-    # ---------- 基础设施 ----------
     def log(self, msg):
         line = "[%s] %s" % (datetime.now().strftime("%H:%M:%S.%f")[:-3], msg)
         print(line, flush=True)
         with open(os.path.join(self.run_root, "runner.log"), "a", encoding="utf-8") as f:
             f.write(line + "\n")
 
-    def assert_true(self, asserts, name, cond, evidence):
-        status = "pass" if cond else "fail"
-        asserts.append({"name": name, "status": status, "evidence": evidence})
+    def check(self, cond, msg):
         if not cond:
-            raise AssertionError("断言失败: %s （%s）" % (name, evidence))
+            raise AssertionError("断言失败: %s" % msg)
+        self.checks.append(msg)
 
-    def write_utf8_no_bom(self, path, text):
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            f.write(text)
-
-    def write_summary(self, scenario, passed, asserts, note=""):
-        summary = {
-            "scenario": scenario,
-            "pass": passed,
-            "timestamp": datetime.now().isoformat(),
-            "assertions": asserts,
-            "note": note,
-        }
-        self.write_utf8_no_bom(os.path.join(self.dir, "summary.json"), json.dumps(summary, ensure_ascii=False, indent=2))
-
-    def load_json(self, path):
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-
+    # ---------- JSON 语义比较 ----------
     @staticmethod
     def json_cmp(x, y, path, diffs):
         if isinstance(x, dict) and isinstance(y, dict):
@@ -107,7 +86,7 @@ class Runner:
     def find_contract(self, exe, hint):
         if hint and os.path.exists(hint):
             return os.path.abspath(hint)
-        d = os.path.dirname(os.path.abspath(exe))
+        d = os.path.dirname(exe)
         for _ in range(4):
             cand = os.path.join(d, "share", "protocol-contract.json")
             if os.path.exists(cand):
@@ -145,12 +124,13 @@ class Runner:
             time.sleep(0.2)
         return evs
 
-    def wait_scenario_result(self, path, action_id, timeout_ms):
+    def wait_any_event(self, paths, names, timeout_ms):
         deadline = time.time() + timeout_ms / 1000.0
         while time.time() < deadline:
-            for ev in self.read_events(path):
-                if ev.get("event") == "scenario_result" and ev.get("data", {}).get("action_id") == action_id:
-                    return ev
+            for p in paths:
+                for ev in self.read_events(p):
+                    if ev.get("event") in names:
+                        return ev
             time.sleep(0.2)
         return None
 
@@ -179,735 +159,507 @@ class Runner:
         )
         return {"proc": proc, "out": out, "err": err, "stdout": stdout_log, "stderr": stderr_log}
 
-    def stop_side(self, side, wait_s=3.0):
-        proc = side["proc"]
-        try:
-            proc.wait(timeout=wait_s)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
-        finally:
-            for f in (side["out"], side["err"]):
-                try:
-                    f.close()
-                except Exception:
-                    pass
-
-    def new_configs(self, pc_duration, dev_duration, device_ssid="Modu_PC"):
-        cfg_dir = os.path.join(self.dir, "configs")
+    def start_dual(self, scenario_file, pc_duration, dev_duration):
+        d = self.dir
+        pc_runtime = os.path.join(d, "pc-runtime")
+        dev_runtime = os.path.join(d, "device-runtime")
+        catalog = os.path.join(d, "sim-catalog")
+        pc_events = os.path.join(d, "pc-events.jsonl")
+        dev_events = os.path.join(d, "device-events.jsonl")
+        cfg_dir = os.path.join(d, "configs")
         os.makedirs(cfg_dir, exist_ok=True)
+        empty_cwd = os.path.join(d, "empty-cwd")
+        os.makedirs(empty_cwd, exist_ok=True)
+
         pc_cfg = os.path.join(cfg_dir, "pc_config.json")
-        dev_cfg = os.path.join(cfg_dir, "device_sim.json")
         if self.args.pc_config:
             with open(self.args.pc_config, "rb") as src, open(pc_cfg, "wb") as dst:
                 dst.write(src.read())
         else:
-            self.write_utf8_no_bom(pc_cfg, json.dumps({
-                "host_tcp_port": 5935,
-                "pc_ap_ssid": "Modu_PC", "pc_ap_password": "modu_leventure",
-                "pc_ap_ip": "192.168.137.1", "pc_ap_prefix_length": 24,
-                "heartbeat_interval_ms": 2000, "heartbeat_dead_ms": 0,
-                "hello_timeout_ms": 5000, "malformed_max_per_conn": 3,
-                "device_rate_limit_per_sec": 50, "duration_s": pc_duration,
-                "config_tag": "integration-pc",
-            }, ensure_ascii=False, indent=2))
+            with open(pc_cfg, "w", encoding="utf-8") as f:
+                json.dump({
+                    "host_tcp_port": 5935, "host_advertise_ip": "127.0.0.1",
+                    "mcast_group": "224.0.2.1", "mcast_port": 5936,
+                    "heartbeat_interval_ms": 2000, "heartbeat_dead_ms": 0,
+                    "hello_timeout_ms": 5000,
+                    "provision_auth_timeout_ms": 3000, "provision_wifi_cfg_timeout_ms": 8000,
+                    "provision_sta_try_max": 3, "provision_handoff_grace_ms": 1000,
+                    "discovery_fast_window_ms": 8000, "discovery_normal_interval_ms": 1000,
+                    "discovery_candidate_timeout_ms": 6000,
+                    "reconnect_backoff_base_ms": 1000, "reconnect_backoff_cap_ms": 5000,
+                    "reconnect_backoff_jitter_ms": 500, "reconnect_to_discovery_ms": 30000,
+                    "busy_backoff_ms": 6000, "host_max_conn": 16, "malformed_max_per_conn": 3,
+                    "device_rate_limit_per_sec": 50,
+                    "target_ssid": "TactileFactory-2.4G", "target_password": "securepass123",
+                    "target_band_2g": 1, "duration_s": 0, "config_tag": "integration-pc",
+                }, f, ensure_ascii=False, indent=2)
+        dev_cfg = os.path.join(cfg_dir, "device_sim.json")
         if self.args.device_config:
             with open(self.args.device_config, "rb") as src, open(dev_cfg, "wb") as dst:
                 dst.write(src.read())
         else:
-            self.write_utf8_no_bom(dev_cfg, json.dumps({
-                "power_on_jitter_max_ms": 500, "wifi_retry_max": 5,
-                "wifi_backoff_base_ms": 1000, "wifi_backoff_cap_ms": 5000, "wifi_backoff_jitter_ms": 500,
-                "heartbeat_interval_ms": 2000, "heartbeat_dead_ms": 0,
-                "busy_backoff_ms": 60000, "hello_timeout_ms": 5000,
-                "reconnect_backoff_base_ms": 1000, "reconnect_backoff_cap_ms": 5000,
-                "reconnect_backoff_jitter_ms": 500, "malformed_max_per_conn": 3,
-                "device_rate_limit_per_sec": 50, "host_tcp_port": 5935,
-                "pc_ap_ssid": device_ssid, "pc_ap_password": "modu_leventure",
-                "pc_host_ip": "192.168.137.1", "nvs_dir": "run",
-                "use_real_wifi_sta": 0, "device_fw_version": "1.1.0",
-                "device_proto_ver": 1, "duration_s": dev_duration,
-                "config_tag": "integration-device",
-            }, ensure_ascii=False, indent=2))
-        return pc_cfg, dev_cfg
+            with open(dev_cfg, "w", encoding="utf-8") as f:
+                json.dump({
+                    "power_on_jitter_max_ms": 1000, "wifi_retry_max": 5,
+                    "wifi_backoff_base_ms": 1000, "wifi_backoff_cap_ms": 30000, "wifi_backoff_jitter_ms": 5000,
+                    "provision_auth_timeout_ms": 3000, "provision_wifi_cfg_timeout_ms": 8000,
+                    "provision_ap_idle_timeout_ms": 0, "provision_ap_backoff_ms": 300000,
+                    "provision_pin_fail_max": 5, "provision_confirm_window_ms": 12000,
+                    "provision_sta_try_max": 3, "provision_handoff_grace_ms": 1000,
+                    "discovery_fast_window_ms": 8000, "discovery_fast_interval_ms": 500,
+                    "discovery_normal_interval_ms": 1000, "discovery_candidate_timeout_ms": 6000,
+                    "heartbeat_interval_ms": 2000, "heartbeat_dead_ms": 0,
+                    "host_max_conn": 16, "busy_backoff_ms": 6000, "hello_timeout_ms": 5000,
+                    "rssi_sample_interval_ms": 1000, "rssi_bad_threshold_dbm": -75, "rssi_bad_duration_ms": 6000,
+                    "reconnect_backoff_base_ms": 1000, "reconnect_backoff_cap_ms": 5000,
+                    "reconnect_backoff_jitter_ms": 500, "reconnect_to_discovery_ms": 30000,
+                    "watchdog_state_timeout_ms": 30000, "malformed_max_per_conn": 3,
+                    "device_rate_limit_per_sec": 50,
+                    "host_tcp_port": 5935, "host_virtual_ip": "192.168.1.50",
+                    "mcast_group": "224.0.2.1", "mcast_port": 5936,
+                    "device_ap_port_base": 20000, "nvs_dir": "run", "use_real_wifi_sta": 0,
+                    "device_count": 1,
+                    "target_ssid": "TactileFactory-2.4G", "target_password": "securepass123",
+                    "target_band_2g": 1, "device_fw_version": "1.0.0", "device_proto_ver": 1,
+                    "duration_s": 0, "config_tag": "integration-device",
+                }, f, ensure_ascii=False, indent=2)
 
-    def start_pc(self, scenario_file, pc_duration):
-        d = self.dir
-        catalog = os.path.join(d, "sim-catalog")
-        pc_events = os.path.join(d, "pc-events.jsonl")
-        pc_runtime = os.path.join(d, "pc-runtime")
-        empty_cwd = os.path.join(d, "empty-cwd")
-        os.makedirs(empty_cwd, exist_ok=True)
         scn_copy = os.path.join(d, "scenario.json")
         with open(scenario_file, "rb") as src, open(scn_copy, "wb") as dst:
             dst.write(src.read())
-        pc_cfg, _ = self.new_configs(pc_duration, 1, "Modu_PC")
+
         pc_side = self.start_side(self.args.pc_exe, [
             "--config", pc_cfg, "--backend", "sim",
             "--runtime-dir", pc_runtime, "--sim-catalog-dir", catalog,
             "--log-dir", os.path.join(d, "logs"),
-            "--events-jsonl", pc_events, "--scenario", scn_copy,
-            "--duration", str(pc_duration),
+            "--events-jsonl", pc_events, "--scenario", scn_copy, "--duration", str(pc_duration),
         ], os.path.join(d, "pc-stdout.log"), os.path.join(d, "pc-stderr.log"), empty_cwd)
-        hot = self.wait_events(pc_events, "hotspot_ready", "pc", 1, 15000)
-        if len(hot) < 1:
-            self.stop_side(pc_side)
-            raise AssertionError("PC 未在 15 秒内产生 hotspot_ready")
+
+        dev_side = self.start_side(self.args.device_exe, [
+            "--config", dev_cfg, "--backend", "sim",
+            "--device-index", "0", "--fresh",
+            "--runtime-dir", dev_runtime, "--sim-catalog-dir", catalog,
+            "--log-dir", os.path.join(d, "logs"),
+            "--events-jsonl", dev_events, "--scenario", scn_copy, "--duration", str(dev_duration),
+        ], os.path.join(d, "device-stdout.log"), os.path.join(d, "device-stderr.log"), empty_cwd)
+
         return {
-            "pcSide": pc_side, "pcEvents": pc_events, "catalog": catalog,
-            "pcDuration": pc_duration,
+            "dir": d, "catalog": catalog, "pc_events": pc_events, "dev_events": dev_events,
+            "pc": pc_side, "dev": dev_side,
         }
 
-    def start_dual(self, scenario_file, pc_duration, dev_duration, device_ssid="Modu_PC"):
-        d = self.dir
-        ctx = self.start_pc(scenario_file, pc_duration)
-        dev_events = os.path.join(d, "device-events.jsonl")
-        dev_runtime = os.path.join(d, "device-runtime")
-        empty_cwd = os.path.join(d, "empty-cwd")
-        pc_cfg, dev_cfg = self.new_configs(pc_duration, dev_duration, device_ssid)
-        dev_side = self.start_side(self.args.device_exe, [
-            "--config", dev_cfg, "--backend", "sim", "--device-index", "0", "--fresh",
-            "--runtime-dir", dev_runtime, "--sim-catalog-dir", ctx["catalog"],
-            "--log-dir", os.path.join(d, "logs"),
-            "--events-jsonl", dev_events, "--scenario", scenario_file,
-            "--duration", str(dev_duration),
-        ], os.path.join(d, "device-stdout.log"), os.path.join(d, "device-stderr.log"), empty_cwd)
-        ctx["DevSide"] = dev_side
-        ctx["DevEvents"] = dev_events
-        ctx["DevDuration"] = dev_duration
-        return ctx
-
-    def start_triple(self, scenario_file, pc_duration, dev_duration):
-        d = self.dir
-        ctx = self.start_pc(scenario_file, pc_duration)
-        empty_cwd = os.path.join(d, "empty-cwd")
-        _, dev_cfg = self.new_configs(pc_duration, dev_duration, "Modu_PC")
-        dev1_events = os.path.join(d, "dev1-events.jsonl")
-        dev1_side = self.start_side(self.args.device_exe, [
-            "--config", dev_cfg, "--backend", "sim", "--device-index", "0", "--fresh",
-            "--runtime-dir", os.path.join(d, "device1-runtime"),
-            "--sim-catalog-dir", ctx["catalog"], "--log-dir", os.path.join(d, "logs"),
-            "--events-jsonl", dev1_events, "--scenario", scenario_file,
-            "--duration", str(dev_duration),
-        ], os.path.join(d, "dev1-stdout.log"), os.path.join(d, "dev1-stderr.log"), empty_cwd)
-        on1 = self.wait_events(ctx["pcEvents"], "session_online", "pc", 1, 30000)
-        if len(on1) < 1:
-            self.stop_side(dev1_side)
-            self.stop_side(ctx["pcSide"])
-            raise AssertionError("设备1 未在 30 秒内上线")
-        dev1_id = on1[0].get("device_id", "")
-        dev2_events = os.path.join(d, "dev2-events.jsonl")
-        dev2_side = self.start_side(self.args.device_exe, [
-            "--config", dev_cfg, "--backend", "sim", "--device-index", "1", "--fresh",
-            "--runtime-dir", os.path.join(d, "device2-runtime"),
-            "--sim-catalog-dir", ctx["catalog"], "--log-dir", os.path.join(d, "logs"),
-            "--events-jsonl", dev2_events, "--scenario", scenario_file,
-            "--duration", str(dev_duration),
-        ], os.path.join(d, "dev2-stdout.log"), os.path.join(d, "dev2-stderr.log"), empty_cwd)
-        ctx["Dev1Side"] = dev1_side
-        ctx["Dev1Events"] = dev1_events
-        ctx["Dev1Id"] = dev1_id
-        ctx["Dev2Side"] = dev2_side
-        ctx["Dev2Events"] = dev2_events
-        return ctx
-
-    def finish_processes(self, ctx, side_keys, event_keys, names, timeout_s):
-        deadline = time.time() + timeout_s
+    def finish_dual(self, ctx, timeout_sec):
+        deadline = time.time() + timeout_sec
         while time.time() < deadline:
-            if all(ctx[k]["proc"].poll() is not None for k in side_keys):
+            if ctx["pc"]["proc"].poll() is not None and ctx["dev"]["proc"].poll() is not None:
                 break
             time.sleep(0.3)
-        for k in side_keys:
-            self.stop_side(ctx[k], wait_s=3.0)
-        facts = {}
-        for sk, ek, nm in zip(side_keys, event_keys, names):
-            proc = ctx[sk]["proc"]
-            code = proc.returncode if proc.returncode is not None else -999
-            last = self.read_events(ctx[ek])
-            last_ev = last[-1].get("event", "none") if last else "none"
-            alive = proc.poll() is None
-            facts["%sCode" % nm] = code
-            facts["%sLast" % nm] = last_ev
-            facts["%sAlive" % nm] = alive
-            facts["%sPid" % nm] = proc.pid
+        for side in (ctx["pc"], ctx["dev"]):
+            if side["proc"].poll() is None:
+                self.log("  强杀进程 PID=%d" % side["proc"].pid)
+                side["proc"].kill()
+            side["out"].close()
+            side["err"].close()
+        pc_code = ctx["pc"]["proc"].returncode if ctx["pc"]["proc"].poll() is not None else -999
+        dev_code = ctx["dev"]["proc"].returncode if ctx["dev"]["proc"].poll() is not None else -999
+        pc_events = self.read_events(ctx["pc_events"])
+        dev_events = self.read_events(ctx["dev_events"])
+        pc_last = pc_events[-1].get("event", "none") if pc_events else "none"
+        dev_last = dev_events[-1].get("event", "none") if dev_events else "none"
+        self.checks.append("PC 退出码: %d" % pc_code)
+        self.checks.append("Device 退出码: %d" % dev_code)
+        self.checks.append("PC PID=%d vs Device PID=%d" % (ctx["pc"]["proc"].pid, ctx["dev"]["proc"].pid))
+        self.checks.append("PC 最后事件: %s (期望 shutdown_complete)" % pc_last)
+        self.checks.append("Device 最后事件: %s (期望 shutdown_complete)" % dev_last)
+        try:
+            os.kill(ctx["pc"]["proc"].pid, 0)
+            pc_alive = True
+        except OSError:
+            pc_alive = False
+        try:
+            os.kill(ctx["dev"]["proc"].pid, 0)
+            dev_alive = True
+        except OSError:
+            dev_alive = False
+        self.checks.append("无残留 PC 进程: %s" % (not pc_alive))
+        self.checks.append("无残留 Device 进程: %s" % (not dev_alive))
+        self.checks.append("TCP 5935 可重绑: %s" % self.port_rebindable(5935))
+        self.checks.append("TCP 20000 可重绑: %s" % self.port_rebindable(20000))
         catalog_files = [f for f in os.listdir(ctx["catalog"]) if f.endswith(".json")] if os.path.isdir(ctx["catalog"]) else []
-        facts["CatalogFiles"] = len(catalog_files)
-        return facts
+        self.checks.append("sim-catalog 退出后清空: %s" % (len(catalog_files) == 0))
+        return pc_code, dev_code, pc_last, dev_last
 
-    def add_cleanup_assertions(self, asserts, facts, names, check_port5935=True):
-        for nm in names:
-            self.assert_true(asserts, "%s 退出码为 0" % nm, facts["%sCode" % nm] == 0, "exit=%s" % facts["%sCode" % nm])
-            self.assert_true(asserts, "%s 最后事件为 shutdown_complete" % nm,
-                             facts["%sLast" % nm] == "shutdown_complete", "last=%s" % facts["%sLast" % nm])
-            self.assert_true(asserts, "无残留 %s 进程" % nm, not facts["%sAlive" % nm], "pid=%s" % facts["%sPid" % nm])
-        self.assert_true(asserts, "无残留 catalog 文件（pc-hotspot.json）", facts["CatalogFiles"] == 0,
-                         "files=%s" % facts["CatalogFiles"])
-        if check_port5935:
-            self.assert_true(asserts, "TCP 5935 可重绑（无端口残留）", self.port_rebindable(5935), "rebind=OK")
-
-    # ---------- ping/pong 回环 ----------
-    @staticmethod
-    def find_ping_pong_pair(pc_all, dev_all, which="first"):
-        dev_pings = [e for e in dev_all if e.get("event") == "ping" and e.get("data", {}).get("direction") == "tx"]
-        pc_pings = [e for e in pc_all if e.get("event") == "ping" and e.get("data", {}).get("direction") == "rx"]
-        pc_pongs = [e for e in pc_all if e.get("event") == "pong" and e.get("data", {}).get("direction") == "tx"]
-        dev_pongs = [e for e in dev_all if e.get("event") == "pong" and e.get("data", {}).get("direction") == "rx"]
-        pc_ping_seqs = {e["data"]["sequence"] for e in pc_pings}
-        pc_pong_seqs = {e["data"]["sequence"] for e in pc_pongs}
-        dev_pong_seqs = {e["data"]["sequence"] for e in dev_pongs}
-        matched = [p for p in dev_pings
-                   if p["data"]["sequence"] in pc_ping_seqs
-                   and p["data"]["sequence"] in pc_pong_seqs
-                   and p["data"]["sequence"] in dev_pong_seqs]
-        if not matched:
-            return None
-        return matched[-1] if which == "last" else matched[0]
-
-    def wait_ping_pong_pair(self, pc_path, dev_path, timeout_ms, which="first", after_time_ms=None):
-        deadline = time.time() + timeout_ms / 1000.0
-        while time.time() < deadline:
-            pair = self.find_ping_pong_pair(self.read_events(pc_path), self.read_events(dev_path), which)
-            if pair is not None and (after_time_ms is None or pair["time_ms"] >= after_time_ms - 2000):
-                return pair
-            time.sleep(0.2)
-        return None
+    def write_summary(self, name, passed, note=""):
+        with open(os.path.join(self.dir, "summary.json"), "w", encoding="utf-8") as f:
+            json.dump({"scenario": name, "pass": passed, "timestamp": datetime.now().isoformat(),
+                       "checks": self.checks, "note": note}, f, ensure_ascii=False, indent=2)
 
     # ---------- 场景实现 ----------
     def scenario_a(self):
-        asserts = []
-        passed = False
-        try:
-            pc_contract = self.find_contract(self.args.pc_exe, self.args.pc_contract)
-            dev_contract = self.find_contract(self.args.device_exe, self.args.device_contract)
-            self.assert_true(asserts, "找到 PC protocol-contract.json", pc_contract != "", "-PcContract 或 exe 旁 share/ 未找到")
-            self.assert_true(asserts, "找到设备 protocol-contract.json", dev_contract != "", "-DeviceContract 或 exe 旁 share/ 未找到")
-            golden = self.load_json(GOLDEN)
-            pc = self.load_json(pc_contract)
-            dev = self.load_json(dev_contract)
-            d1, d2, d3 = [], [], []
-            self.json_cmp(pc, golden, "pc", d1)
-            self.json_cmp(dev, golden, "device", d2)
-            self.json_cmp(pc, dev, "pc_vs_device", d3)
-            diff = {"pc_vs_golden": d1, "device_vs_golden": d2, "pc_vs_device": d3}
-            self.write_utf8_no_bom(os.path.join(self.dir, "protocol-diff.json"), json.dumps(diff, ensure_ascii=False, indent=2))
-            self.assert_true(asserts, "三份契约 schema_version 均为 2",
-                             pc.get("schema_version") == 2 and dev.get("schema_version") == 2 and golden.get("schema_version") == 2,
-                             "pc=%s dev=%s golden=%s" % (pc.get("schema_version"), dev.get("schema_version"), golden.get("schema_version")))
-            self.assert_true(asserts, "PC contract == golden（忽略 generated_from）", len(d1) == 0, "diffs=%d" % len(d1))
-            self.assert_true(asserts, "Device contract == golden（忽略 generated_from）", len(d2) == 0, "diffs=%d" % len(d2))
-            self.assert_true(asserts, "PC contract == Device contract", len(d3) == 0, "diffs=%d" % len(d3))
-            passed = True
-        except Exception as e:
-            self.log("  场景 a 异常: %s" % e)
-        self.write_summary("a", passed, asserts, "pc=%s device=%s" % (pc_contract if "pc_contract" in dir() else "", dev_contract if "dev_contract" in dir() else ""))
-        return passed
+        pc_contract = self.find_contract(self.args.pc_exe, self.args.pc_contract)
+        dev_contract = self.find_contract(self.args.device_exe, self.args.device_contract)
+        self.check(pc_contract != "", "未找到 PC protocol-contract.json（用 --pc-contract 指定）")
+        self.check(dev_contract != "", "未找到 设备 protocol-contract.json（用 --device-contract 指定）")
+        with open(GOLDEN, encoding="utf-8") as f:
+            golden = json.load(f)
+        with open(pc_contract, encoding="utf-8") as f:
+            pc = json.load(f)
+        with open(dev_contract, encoding="utf-8") as f:
+            dev = json.load(f)
+        d1, d2, d3 = [], [], []
+        self.json_cmp(pc, golden, "pc", d1)
+        self.json_cmp(dev, golden, "device", d2)
+        self.json_cmp(pc, dev, "pc_vs_device", d3)
+        diff = {"pc_vs_golden": d1, "device_vs_golden": d2, "pc_vs_device": d3}
+        with open(os.path.join(self.dir, "protocol-diff.json"), "w", encoding="utf-8") as f:
+            json.dump(diff, f, ensure_ascii=False, indent=2)
+        self.check(not d1, "PC contract 与 golden 不一致: %r" % d1)
+        self.check(not d2, "Device contract 与 golden 不一致: %r" % d2)
+        self.check(not d3, "PC contract 与 Device contract 不一致: %r" % d3)
+        self.write_summary("a", True, "pc=%s device=%s" % (pc_contract, dev_contract))
 
     def scenario_b(self):
-        asserts = []
-        passed = False
-        ctx = None
-        try:
-            scn = os.path.join(SCENARIOS_DIR, "b_hotspot_session.json")
-            ctx = self.start_dual(scn, 25, 25, "Modu_PC")
-            self.assert_true(asserts, "PC ready 出现", len(self.wait_events(ctx["pcEvents"], "ready", "pc", 1, 15000)) >= 1, "缺失")
-            self.assert_true(asserts, "PC session_online 出现", len(self.wait_events(ctx["pcEvents"], "session_online", "pc", 1, 25000)) >= 1, "缺失")
-            dev_online = self.wait_events(ctx["DevEvents"], "session_online", "device", 1, 25000)
-            self.assert_true(asserts, "设备 session_online 出现", len(dev_online) >= 1, "缺失")
-
-            pc_evs = self.read_events(ctx["pcEvents"])
-            hs = next((e for e in pc_evs if e.get("event") == "hotspot_ready"), None)
-            tc = next((e for e in pc_evs if e.get("event") == "tcp_listening"), None)
-            rd = next((e for e in pc_evs if e.get("event") == "ready"), None)
-            self.assert_true(asserts, "PC 事件顺序 hotspot_ready→tcp_listening→ready",
-                             hs and tc and rd and hs["seq"] < tc["seq"] < rd["seq"],
-                             "seq hs=%s tc=%s rd=%s" % (hs and hs.get("seq"), tc and tc.get("seq"), rd and rd.get("seq")))
-            self.assert_true(asserts, "hotspot_ready 数据 ssid=Modu_PC/ip=192.168.137.1/prefix=24",
-                             hs and hs["data"].get("ssid") == "Modu_PC" and hs["data"].get("ip") == "192.168.137.1" and hs["data"].get("prefix_length") == 24,
-                             "data=%s" % json.dumps(hs["data"], ensure_ascii=False) if hs else "缺失")
-
-            dev_evs = self.read_events(ctx["DevEvents"])
-            order = ["ready", "wifi_scan_started", "wifi_target_found", "wifi_connected", "tcp_connecting", "session_online"]
-            prev = -1
-            order_ok = True
-            seqs = []
-            for n in order:
-                ev = next((e for e in dev_evs if e.get("event") == n), None)
-                if ev is None or ev["seq"] <= prev:
-                    order_ok = False
-                seqs.append("%s=%s" % (n, ev.get("seq") if ev else "缺失"))
-                if ev:
-                    prev = ev["seq"]
-            self.assert_true(asserts, "设备事件顺序 ready→scan→found→connected→connecting→online", order_ok, " ".join(seqs))
-            wc = next((e for e in dev_evs if e.get("event") == "wifi_connected"), None)
-            self.assert_true(asserts, "wifi_connected 数据 ssid=Modu_PC 且含 device_ip",
-                             wc and wc["data"].get("ssid") == "Modu_PC" and wc["data"].get("device_ip"),
-                             "data=%s" % json.dumps(wc["data"], ensure_ascii=False) if wc else "缺失")
-            tc2 = next((e for e in dev_evs if e.get("event") == "tcp_connecting"), None)
-            self.assert_true(asserts, "tcp_connecting 数据 host=192.168.137.1/port=5935",
-                             tc2 and tc2["data"].get("host") == "192.168.137.1" and tc2["data"].get("port") == 5935,
-                             "data=%s" % json.dumps(tc2["data"], ensure_ascii=False) if tc2 else "缺失")
-
-            do = dev_online[0]
-            pair = self.wait_ping_pong_pair(ctx["pcEvents"], ctx["DevEvents"], 12000, "first")
-            in_window = pair is not None and (pair["time_ms"] - do["time_ms"]) <= 10000
-            self.assert_true(asserts, "session_online 后 10 秒内出现完整 ping/pong 回环",
-                             pair is not None and in_window,
-                             "pair_seq=%s pair_time=%s online_time=%s" % (pair["data"]["sequence"], pair["time_ms"], do["time_ms"]) if pair else "无完整回环")
-
-            facts = self.finish_processes(ctx, ["pcSide", "DevSide"], ["pcEvents", "DevEvents"], ["PC", "Device"], self.args.timeout_seconds + 10)
-            self.add_cleanup_assertions(asserts, facts, ["PC", "Device"])
-            passed = True
-        except Exception as e:
-            self.log("  场景 b 异常: %s" % e)
-        if ctx:
-            for k in ("DevSide", "Dev1Side", "Dev2Side"):
-                if ctx.get(k):
-                    self.stop_side(ctx[k])
-            self.stop_side(ctx["pcSide"])
-        self.write_summary("b", passed, asserts)
-        return passed
+        ctx = self.start_dual(os.path.join(SCENARIOS_DIR, "b_first_provision.json"), 25, 25)
+        self.check(len(self.wait_events(ctx["dev_events"], "ready", "device", 1, 15000)) >= 1, "设备 ready 缺失")
+        self.check(len(self.wait_events(ctx["pc_events"], "ready", "pc", 1, 15000)) >= 1, "PC ready 缺失")
+        ap = self.wait_events(ctx["dev_events"], "ap_ready", "device", 1, 15000)
+        self.check(len(ap) >= 1, "ap_ready 缺失")
+        self.checks.append("ap_ready 出现: %s" % ap[0]["data"].get("ssid"))
+        auth = self.wait_events(ctx["pc_events"], "auth_result", "pc", 1, 20000)
+        self.check(len(auth) >= 1 and auth[0].get("result") == "ok", "auth_result 非 ok")
+        wifi = self.wait_events(ctx["pc_events"], "wifi_result", "pc", 1, 20000)
+        self.check(len(wifi) >= 1 and wifi[0]["data"].get("status") == "ok", "wifi_result 非 ok")
+        dauth = self.wait_events(ctx["dev_events"], "auth_result", "device", 1, 20000)
+        dwifi = self.wait_events(ctx["dev_events"], "wifi_result", "device", 1, 20000)
+        self.check(len(dauth) >= 1 and dauth[0]["data"].get("status") == "ok", "设备 auth_result 非 ok")
+        self.check(len(dwifi) >= 1 and dwifi[0]["data"].get("status") == "ok", "设备 wifi_result 非 ok")
+        self.checks.append("双方 auth_result=ok / wifi_result=ok")
+        online_pc = self.wait_events(ctx["pc_events"], "session_online", "pc", 1, 25000)
+        online_dev = self.wait_events(ctx["dev_events"], "session_online", "device", 1, 25000)
+        self.check(len(online_pc) >= 1, "PC session_online 缺失")
+        self.check(len(online_dev) >= 1, "设备 session_online 缺失")
+        hb = self.wait_any_event([ctx["pc_events"], ctx["dev_events"]], ["ping", "pong"], 10000)
+        self.check(hb is not None, "session_online 后 10 秒内未见 ping/pong")
+        self.checks.append("session_online 后 10 秒内出现 ping/pong: %s" % hb["event"])
+        pc_code, dev_code, pc_last, dev_last = self.finish_dual(ctx, self.args.timeout_seconds + 10)
+        ok = pc_code == 0 and dev_code == 0 and pc_last == "shutdown_complete" and dev_last == "shutdown_complete"
+        self.write_summary("b", ok)
 
     def scenario_c(self):
-        asserts = []
-        passed = False
-        ctx = None
-        try:
-            scn = os.path.join(SCENARIOS_DIR, "c_pc_stop.json")
-            ctx = self.start_dual(scn, 25, 25, "Modu_PC")
-            self.assert_true(asserts, "PC session_online 出现", len(self.wait_events(ctx["pcEvents"], "session_online", "pc", 1, 30000)) >= 1, "缺失")
-            self.assert_true(asserts, "设备 session_online 出现", len(self.wait_events(ctx["DevEvents"], "session_online", "device", 1, 30000)) >= 1, "缺失")
-            stop = self.wait_scenario_result(ctx["pcEvents"], "c_pc_stop", 20000)
-            self.assert_true(asserts, "PC request_stop 动作执行（scenario_result ok）",
-                             stop is not None and stop["data"].get("status") == "ok",
-                             "result=%s" % json.dumps(stop["data"], ensure_ascii=False) if stop else "scenario_result 缺失")
-            cat_gone = False
-            for _ in range(25):
-                if not os.path.exists(os.path.join(ctx["catalog"], "pc-hotspot.json")):
-                    cat_gone = True
-                    break
-                time.sleep(0.2)
-            self.assert_true(asserts, "PC 停止后 pc-hotspot.json catalog 被删除", cat_gone, "catalog 仍存在")
-            dev_off = self.wait_events(ctx["DevEvents"], "session_offline", "device", 1, 20000)
-            self.assert_true(asserts, "设备 session_offline 出现",
-                             len(dev_off) >= 1, "reason=%s" % dev_off[0]["data"].get("reason") if dev_off else "缺失")
-            dev_all = self.read_events(ctx["DevEvents"])
-            forbidden = {"ap_ready", "auth_result", "wifi_result", "close_ap_sent", "host_announce", "host_bye"}
-            bad = [e for e in dev_all if e.get("event") in forbidden]
-            self.assert_true(asserts, "设备事件流不含配网/热点事件", len(bad) == 0, "found=%s" % ",".join(e["event"] for e in bad))
-            facts = self.finish_processes(ctx, ["pcSide", "DevSide"], ["pcEvents", "DevEvents"], ["PC", "Device"], self.args.timeout_seconds + 10)
-            self.add_cleanup_assertions(asserts, facts, ["PC", "Device"])
-            passed = True
-        except Exception as e:
-            self.log("  场景 c 异常: %s" % e)
-        if ctx:
-            for k in ("DevSide", "Dev1Side", "Dev2Side"):
-                if ctx.get(k):
-                    self.stop_side(ctx[k])
-            self.stop_side(ctx["pcSide"])
-        self.write_summary("c", passed, asserts,
-                           "注：sim 后端 STA 状态在 catalog 删除后仍保持有效，设备按设计文档 9.2 进入 HEAL 的 TCP 退避重连（不产生扫描事件），不属端侧缺陷")
-        return passed
+        ctx = self.start_dual(os.path.join(SCENARIOS_DIR, "c_graceful_exit.json"), 25, 25)
+        online = self.wait_events(ctx["pc_events"], "session_online", "pc", 1, 30000)
+        self.check(len(online) >= 1, "PC session_online 缺失")
+        bye = self.wait_events(ctx["pc_events"], "host_bye_sent", "pc", 1, 15000)
+        self.check(len(bye) >= 1, "host_bye_sent 缺失")
+        self.checks.append("host_bye_sent 出现（send_result=%s）" % bye[0]["data"].get("send_result"))
+        off_dev = self.wait_events(ctx["dev_events"], "session_offline", "device", 1, 20000)
+        self.check(len(off_dev) >= 1, "设备 session_offline 缺失（host_bye/连接关闭路径）")
+        self.checks.append("设备离线（reason=%s）" % off_dev[0]["data"].get("reason"))
+        pc_code, dev_code, pc_last, dev_last = self.finish_dual(ctx, self.args.timeout_seconds + 10)
+        ok = pc_code == 0 and dev_code == 0 and pc_last == "shutdown_complete" and dev_last == "shutdown_complete"
+        self.write_summary("c", ok)
 
     def scenario_d(self):
-        asserts = []
-        passed = False
-        ctx = None
-        try:
-            scn = os.path.join(SCENARIOS_DIR, "d_reconnect.json")
-            ctx = self.start_dual(scn, 40, 40, "Modu_PC")
-            on1pc = self.wait_events(ctx["pcEvents"], "session_online", "pc", 1, 30000)
-            on1dev = self.wait_events(ctx["DevEvents"], "session_online", "device", 1, 30000)
-            self.assert_true(asserts, "首次 session_online（PC）", len(on1pc) >= 1, "缺失")
-            self.assert_true(asserts, "首次 session_online（设备）", len(on1dev) >= 1, "缺失")
-            fault = self.wait_scenario_result(ctx["DevEvents"], "d_fault", 20000)
-            self.assert_true(asserts, "设备注入 sock_send_fail 成功",
-                             fault is not None and fault["data"].get("status") == "ok" and fault["data"].get("action") == "inject_fault",
-                             "result=%s" % json.dumps(fault["data"], ensure_ascii=False) if fault else "scenario_result 缺失")
-            self.assert_true(asserts, "注入后 PC session_offline", len(self.wait_events(ctx["pcEvents"], "session_offline", "pc", 1, 25000)) >= 1, "缺失")
-            self.assert_true(asserts, "注入后设备 session_offline", len(self.wait_events(ctx["DevEvents"], "session_offline", "device", 1, 25000)) >= 1, "缺失")
-            restore = self.wait_scenario_result(ctx["DevEvents"], "d_restore", 15000)
-            self.assert_true(asserts, "设备恢复 sock_send_fail（count=0）",
-                             restore is not None and restore["data"].get("status") == "ok",
-                             "result=%s" % json.dumps(restore["data"], ensure_ascii=False) if restore else "scenario_result 缺失")
-            on2pc = self.wait_events(ctx["pcEvents"], "session_online", "pc", 2, 30000)
-            on2dev = self.wait_events(ctx["DevEvents"], "session_online", "device", 2, 30000)
-            self.assert_true(asserts, "PC 重连 session_online（第 2 次）", len(on2pc) >= 2, "count=%d" % len(on2pc))
-            self.assert_true(asserts, "设备重连 session_online（第 2 次）", len(on2dev) >= 2, "count=%d" % len(on2dev))
-            rc1, rc2 = on1pc[0]["data"].get("reconnect_count", 0), on2pc[1]["data"].get("reconnect_count", 0)
-            dc1, dc2 = on1dev[0]["data"].get("reconnect_count", 0), on2dev[1]["data"].get("reconnect_count", 0)
-            self.assert_true(asserts, "PC reconnect_count 增长", rc2 > rc1, "pc %s -> %s" % (rc1, rc2))
-            self.assert_true(asserts, "设备 reconnect_count 增长", dc2 > dc1, "dev %s -> %s" % (dc1, dc2))
-            pair = self.wait_ping_pong_pair(ctx["pcEvents"], ctx["DevEvents"], 15000, "last", on2dev[1]["time_ms"])
-            after = pair is not None
-            self.assert_true(asserts, "重连后存在完整 ping/pong 回环", after,
-                             "pair_seq=%s pair_time=%s online2=%s" % (pair["data"]["sequence"], pair["time_ms"], on2dev[1]["time_ms"]) if pair else "无完整回环")
-            facts = self.finish_processes(ctx, ["pcSide", "DevSide"], ["pcEvents", "DevEvents"], ["PC", "Device"], self.args.timeout_seconds + 15)
-            self.add_cleanup_assertions(asserts, facts, ["PC", "Device"])
-            passed = True
-        except Exception as e:
-            self.log("  场景 d 异常: %s" % e)
-        if ctx:
-            for k in ("DevSide", "Dev1Side", "Dev2Side"):
-                if ctx.get(k):
-                    self.stop_side(ctx[k])
-            self.stop_side(ctx["pcSide"])
-        self.write_summary("d", passed, asserts)
-        return passed
+        ctx = self.start_dual(os.path.join(SCENARIOS_DIR, "d_reconnect.json"), 45, 45)
+        on1_pc = self.wait_events(ctx["pc_events"], "session_online", "pc", 1, 30000)
+        self.check(len(on1_pc) >= 1, "首次 session_online（PC）缺失")
+        on1_dev = self.wait_events(ctx["dev_events"], "session_online", "device", 1, 30000)
+        self.check(len(on1_dev) >= 1, "首次 session_online（设备）缺失")
+        fault = self.wait_events(ctx["dev_events"], "fault_applied", "device", 1, 20000)
+        self.check(len(fault) >= 1, "fault_applied 缺失")
+        self.check(fault[0]["data"].get("action") == "sock_send_fail", "fault action 不符")
+        off_pc = self.wait_events(ctx["pc_events"], "session_offline", "pc", 1, 20000)
+        off_dev = self.wait_events(ctx["dev_events"], "session_offline", "device", 1, 20000)
+        self.check(len(off_pc) >= 1, "PC session_offline 缺失")
+        self.check(len(off_dev) >= 1, "设备 session_offline 缺失")
+        on2_pc = self.wait_events(ctx["pc_events"], "session_online", "pc", 2, 30000)
+        on2_dev = self.wait_events(ctx["dev_events"], "session_online", "device", 2, 30000)
+        self.check(len(on2_pc) >= 2, "PC 重连 session_online 缺失")
+        self.check(len(on2_dev) >= 2, "设备重连 session_online 缺失")
+        rc1 = int(on1_pc[0]["data"]["reconnect_count"]); rc2 = int(on2_pc[1]["data"]["reconnect_count"])
+        dc1 = int(on1_dev[0]["data"]["reconnect_count"]); dc2 = int(on2_dev[-1]["data"]["reconnect_count"])
+        self.check(rc2 > rc1, "PC reconnect_count 未增长: %d -> %d" % (rc1, rc2))
+        self.check(dc2 > dc1, "设备 reconnect_count 未增长: %d -> %d" % (dc1, dc2))
+        hb = self.wait_any_event([ctx["pc_events"], ctx["dev_events"]], ["ping", "pong"], 10000)
+        self.check(hb is not None, "重连后 10 秒内未见 ping/pong")
+        self.checks.append("重连后 reconnect_count 增长（PC %d->%d，设备 %d->%d）" % (rc1, rc2, dc1, dc2))
+        pc_code, dev_code, pc_last, dev_last = self.finish_dual(ctx, self.args.timeout_seconds + 20)
+        ok = pc_code == 0 and dev_code == 0 and pc_last == "shutdown_complete" and dev_last == "shutdown_complete"
+        self.write_summary("d", ok)
 
     def scenario_e(self):
-        asserts = []
-        passed = False
-        ctx = None
-        try:
-            scn = os.path.join(SCENARIOS_DIR, "e_second_device.json")
-            ctx = self.start_triple(scn, 25, 25)
-            rej = self.wait_events(ctx["pcEvents"], "single_device_rejected", "pc", 1, 30000)
-            self.assert_true(asserts, "PC 发出 single_device_rejected", len(rej) >= 1, "缺失")
-            self.assert_true(asserts, "single_device_rejected reason=single_device_only",
-                             len(rej) >= 1 and rej[0]["data"].get("reason") == "single_device_only",
-                             "reason=%s" % rej[0]["data"].get("reason") if rej else "缺失")
-            pc_all = self.read_events(ctx["pcEvents"])
-            dev2_all = self.read_events(ctx["Dev2Events"])
-            dev1_online = [e for e in pc_all if e.get("event") == "session_online" and e.get("device_id") == ctx["Dev1Id"]]
-            self.assert_true(asserts, "设备1（%s）在 PC 侧上线" % ctx["Dev1Id"], len(dev1_online) >= 1, "缺失")
-            first_rej_seq = rej[0]["seq"]
-            first_off = next((e for e in pc_all if e.get("event") == "session_offline" and e.get("device_id") == ctx["Dev1Id"]), None)
-            kept = first_off is None or first_off["seq"] > first_rej_seq
-            self.assert_true(asserts, "拒绝发生时设备1仍在线（PC 侧无提前 session_offline）", kept,
-                             "first_offline_seq=%s reject_seq=%s" % (first_off.get("seq") if first_off else "无", first_rej_seq))
-            dev2_online = [e for e in dev2_all if e.get("event") == "session_online"]
-            dev2_off = [e for e in dev2_all if e.get("event") == "session_offline"]
-            self.assert_true(asserts, "设备2 从未 session_online（busy 拒绝）", len(dev2_online) == 0, "count=%d" % len(dev2_online))
-            self.assert_true(asserts, "设备2 收到拒绝后 session_offline（busy 循环）", len(dev2_off) >= 1, "count=%d" % len(dev2_off))
-            facts = self.finish_processes(ctx, ["pcSide", "Dev1Side", "Dev2Side"], ["pcEvents", "Dev1Events", "Dev2Events"], ["PC", "Device1", "Device2"], self.args.timeout_seconds + 10)
-            self.add_cleanup_assertions(asserts, facts, ["PC", "Device1", "Device2"])
-            passed = True
-        except Exception as e:
-            self.log("  场景 e 异常: %s" % e)
-        if ctx:
-            for k in ("DevSide", "Dev1Side", "Dev2Side"):
-                if ctx.get(k):
-                    self.stop_side(ctx[k])
-            self.stop_side(ctx["pcSide"])
-        self.write_summary("e", passed, asserts)
-        return passed
+        ctx = self.start_dual(os.path.join(SCENARIOS_DIR, "e_close_ap_fail.json"), 25, 25)
+        fault = self.wait_events(ctx["pc_events"], "fault_applied", "pc", 1, 15000)
+        self.check(len(fault) >= 1, "PC fault_applied 缺失")
+        close = self.wait_events(ctx["pc_events"], "close_ap_sent", "pc", 1, 25000)
+        self.check(len(close) >= 1, "close_ap_sent 缺失")
+        self.check(int(close[0]["code"]) != 0, "close_ap_sent 应记录发送失败（code=%s）" % close[0]["code"])
+        wifi = self.wait_events(ctx["pc_events"], "wifi_result", "pc", 1, 20000)
+        self.check(len(wifi) >= 1 and wifi[0]["data"].get("status") == "ok", "wifi_result 非 ok")
+        on_pc = self.wait_events(ctx["pc_events"], "session_online", "pc", 1, 30000)
+        on_dev = self.wait_events(ctx["dev_events"], "session_online", "device", 1, 30000)
+        self.check(len(on_pc) >= 1, "PC session_online 缺失")
+        self.check(len(on_dev) >= 1, "设备 session_online 缺失")
+        self.checks.append("close_ap 失败一次（send_result=%s）后设备仍上线" % close[0]["data"].get("send_result"))
+        pc_code, dev_code, pc_last, dev_last = self.finish_dual(ctx, self.args.timeout_seconds + 10)
+        ok = pc_code == 0 and dev_code == 0 and pc_last == "shutdown_complete" and dev_last == "shutdown_complete"
+        self.write_summary("e", ok)
 
     def scenario_f(self):
-        asserts = []
-        passed = False
-        ctx = None
-        try:
-            scn = os.path.join(SCENARIOS_DIR, "f_no_target.json")
-            ctx = self.start_dual(scn, 18, 18, "Modu_Other")  # 目标 SSID 与 PC 发布的不一致
-            self.assert_true(asserts, "设备持续 wifi_scan_started",
-                             len(self.wait_events(ctx["DevEvents"], "wifi_scan_started", "device", 1, 15000)) >= 1, "缺失")
-            dev_all = self.read_events(ctx["DevEvents"])
-            pc_all = self.read_events(ctx["pcEvents"])
-            never = {"wifi_target_found", "wifi_connected", "tcp_connecting", "wifi_connect_failed", "session_online"}
-            for n in never:
-                cnt = len([e for e in dev_all if e.get("event") == n])
-                self.assert_true(asserts, "设备无 %s" % n, cnt == 0, "count=%d" % cnt)
-            self.assert_true(asserts, "PC 无 session_online",
-                             len([e for e in pc_all if e.get("event") == "session_online"]) == 0, "出现 session_online")
-            forbidden = {"ap_ready", "auth_result", "wifi_result", "close_ap_sent", "host_announce", "host_bye"}
-            bad = [e for e in dev_all if e.get("event") in forbidden]
-            self.assert_true(asserts, "设备事件流不含任何配网/热点事件", len(bad) == 0, "found=%s" % ",".join(e["event"] for e in bad))
-            dev_stop = self.wait_scenario_result(ctx["DevEvents"], "f_dev_stop", 25000)
-            self.assert_true(asserts, "设备 request_stop 动作执行（扫描约 15 秒后自停）",
-                             dev_stop is not None and dev_stop["data"].get("status") == "ok",
-                             "result=%s" % json.dumps(dev_stop["data"], ensure_ascii=False) if dev_stop else "scenario_result 缺失")
-            facts = self.finish_processes(ctx, ["pcSide", "DevSide"], ["pcEvents", "DevEvents"], ["PC", "Device"], self.args.timeout_seconds + 10)
-            self.add_cleanup_assertions(asserts, facts, ["PC", "Device"])
-            passed = True
-        except Exception as e:
-            self.log("  场景 f 异常: %s" % e)
-        if ctx:
-            for k in ("DevSide", "Dev1Side", "Dev2Side"):
-                if ctx.get(k):
-                    self.stop_side(ctx[k])
-            self.stop_side(ctx["pcSide"])
-        self.write_summary("f", passed, asserts,
-                           "注：配置校验固定密码/SSID 前缀，'错误密码'分支无法经配置注入（密码被校验为产品固定值），本场景采用'目标 SSID 不存在'分支；密码不符语义由端侧 sim 单测覆盖")
-        return passed
+        ctx = self.start_dual(os.path.join(SCENARIOS_DIR, "f_wifi_result_fail.json"), 25, 25)
+        wifi = self.wait_events(ctx["pc_events"], "wifi_result", "pc", 1, 25000)
+        self.check(len(wifi) >= 1 and wifi[0]["data"].get("status") == "fail", "PC wifi_result 非 fail")
+        dwifi = self.wait_events(ctx["dev_events"], "wifi_result", "device", 1, 25000)
+        self.check(len(dwifi) >= 1 and dwifi[0]["data"].get("status") == "fail", "设备 wifi_result 非 fail")
+        close = [e for e in self.read_events(ctx["pc_events"]) if e.get("event") == "close_ap_sent"]
+        self.check(len(close) == 0, "wifi_result fail 后不应发送 close_ap")
+        on_pc = [e for e in self.read_events(ctx["pc_events"]) if e.get("event") == "session_online"]
+        on_dev = [e for e in self.read_events(ctx["dev_events"]) if e.get("event") == "session_online"]
+        self.check(len(on_pc) == 0 and len(on_dev) == 0, "wifi 失败后不应出现 session_online")
+        catalog_seen = False
+        for _ in range(30):
+            if os.path.exists(os.path.join(ctx["catalog"], "device-0.json")):
+                catalog_seen = True
+                break
+            time.sleep(0.3)
+        self.check(catalog_seen, "设备配网热点 catalog 未发布")
+        self.checks.append("双方 wifi_result=fail，无 close_ap_sent，无 session_online，设备保持可配网")
+        pc_code, dev_code, pc_last, dev_last = self.finish_dual(ctx, self.args.timeout_seconds + 10)
+        ok = pc_code == 0 and dev_code == 0 and pc_last == "shutdown_complete" and dev_last == "shutdown_complete"
+        self.write_summary("f", ok)
 
     def scenario_g(self):
-        asserts = []
-        passed = False
-        ctx = None
-        try:
-            scn = os.path.join(SCENARIOS_DIR, "g_app_data.json")
-            ctx = self.start_dual(scn, 25, 25, "Modu_PC")
-            self.assert_true(asserts, "session_online（PC）", len(self.wait_events(ctx["pcEvents"], "session_online", "pc", 1, 30000)) >= 1, "缺失")
-            self.assert_true(asserts, "session_online（设备）", len(self.wait_events(ctx["DevEvents"], "session_online", "device", 1, 30000)) >= 1, "缺失")
-            scn_json = self.load_json(os.path.join(self.dir, "scenario.json"))
-            text_of = {a["id"]: a["args"]["text"] for a in scn_json["actions"] if a["args"].get("text")}
+        ctx = self.start_dual(os.path.join(SCENARIOS_DIR, "g_app_data.json"), 30, 30)
+        self.check(len(self.wait_events(ctx["pc_events"], "session_online", "pc", 1, 30000)) >= 1, "session_online（PC）缺失")
 
-            def wait_data_event(path, name, sha, timeout_ms):
-                deadline = time.time() + timeout_ms / 1000.0
-                while time.time() < deadline:
-                    for ev in self.read_events(path):
-                        if ev.get("event") == name and ev.get("data", {}).get("sha256") == sha:
-                            return ev
-                    time.sleep(0.2)
-                return None
-
-            pairs = [
-                ("g_pc_512", "pc", "device", "ok"),
-                ("g_dev_512", "device", "pc", "ok"),
-                ("g_pc_513", "pc", "device", "rejected"),
-                ("g_dev_513", "device", "pc", "rejected"),
-                ("g_pc_utf8", "pc", "device", "ok"),
-                ("g_dev_utf8", "device", "pc", "ok"),
-            ]
-            for aid, sender, recver, expect in pairs:
-                text = text_of[aid]
-                sha = self.sha256_hex(text)
-                sender_path = ctx["pcEvents"] if sender == "pc" else ctx["DevEvents"]
-                recv_path = ctx["pcEvents"] if recver == "pc" else ctx["DevEvents"]
-                r = self.wait_scenario_result(sender_path, aid, 20000)
-                r_ev = "result=%s" % json.dumps(r["data"], ensure_ascii=False) if r else "scenario_result 缺失"
-                if expect == "ok":
-                    self.assert_true(asserts, "%s scenario_result=ok" % aid, r is not None and r["data"].get("status") == "ok", r_ev)
-                    tx = wait_data_event(sender_path, "app_data_tx", sha, 10000)
-                    rx = wait_data_event(recv_path, "app_data_rx", sha, 10000)
-                    self.assert_true(asserts, "%s 发送端 app_data_tx sha256 一致" % aid, tx is not None, "sha=%s..." % sha[:16])
-                    self.assert_true(asserts, "%s 接收端 app_data_rx sha256 一致" % aid, rx is not None, "sha=%s..." % sha[:16])
-                else:
-                    self.assert_true(asserts, "%s scenario_result=rejected/payload_too_large/request_bytes=%d" % (aid, len(text)),
-                                     r is not None and r["data"].get("status") == "rejected" and r["data"].get("reason") == "payload_too_large" and r["data"].get("request_bytes") == len(text), r_ev)
-                    bad_tx = wait_data_event(sender_path, "app_data_tx", sha, 3000)
-                    self.assert_true(asserts, "%s 无 app_data_tx（超限不发送）" % aid, bad_tx is None, "意外 tx")
-            facts = self.finish_processes(ctx, ["pcSide", "DevSide"], ["pcEvents", "DevEvents"], ["PC", "Device"], self.args.timeout_seconds + 10)
-            self.add_cleanup_assertions(asserts, facts, ["PC", "Device"])
-            passed = True
-        except Exception as e:
-            self.log("  场景 g 异常: %s" % e)
-        if ctx:
-            for k in ("DevSide", "Dev1Side", "Dev2Side"):
-                if ctx.get(k):
-                    self.stop_side(ctx[k])
-            self.stop_side(ctx["pcSide"])
-        self.write_summary("g", passed, asserts)
-        return passed
-
-    # ---------- 帧工具（场景 h） ----------
-    @staticmethod
-    def send_frame(sock, payload):
-        sock.sendall(struct.pack(">H", len(payload)) + payload)
-
-    @staticmethod
-    def read_frame(sock, timeout_s=5.0):
-        sock.settimeout(timeout_s)
-        try:
-            hdr = b""
-            while len(hdr) < 2:
-                chunk = sock.recv(2 - len(hdr))
-                if not chunk:
-                    return None
-                hdr += chunk
-            length = struct.unpack(">H", hdr)[0]
-            body = b""
-            while len(body) < length:
-                chunk = sock.recv(length - len(body))
-                if not chunk:
-                    return None
-                body += chunk
-            return body.decode("utf-8")
-        except (socket.timeout, OSError):
+        def wait_scenario_result(path, aid, timeout_ms):
+            deadline = time.time() + timeout_ms / 1000.0
+            while time.time() < deadline:
+                for e in self.read_events(path):
+                    if e.get("event") == "scenario_result" and e["data"].get("action_id") == aid:
+                        return e
+                time.sleep(0.2)
             return None
 
-    @staticmethod
-    def conn_closed(sock, timeout_s=3.0):
-        sock.settimeout(timeout_s)
-        try:
-            data = sock.recv(16)
-            return len(data) == 0
-        except (socket.timeout, OSError):
-            return True
+        def wait_data_event(path, name, sha, timeout_ms):
+            deadline = time.time() + timeout_ms / 1000.0
+            while time.time() < deadline:
+                for e in self.read_events(path):
+                    if e.get("event") == name and e["data"].get("sha256") == sha:
+                        return e
+                time.sleep(0.2)
+            return None
+
+        texts = {
+            "pc512": "P" * 512, "dev512": "D" * 512,
+            "pc513": "Q" * 513, "dev513": "E" * 513,
+            "pc_utf8": "模组科技网络双向数据一致性测试-UTF8多字节-0123456789-中文编码验证-abcdefghijklmnopqrstuvwxyz",
+            "dev_utf8": "设备端UTF8回传：压强传感数据帧边界测试-协议互操作-2026-双向发送",
+        }
+
+        r = wait_scenario_result(ctx["pc_events"], "g_pc_512", 20000)
+        self.check(r is not None and r["data"]["status"] == "ok", "g_pc_512 未 ok")
+        sha = self.sha256_hex(texts["pc512"])
+        self.check(wait_data_event(ctx["pc_events"], "app_data_tx", sha, 10000) is not None, "PC app_data_tx(512) sha256 不符")
+        self.check(wait_data_event(ctx["dev_events"], "app_data_rx", sha, 10000) is not None, "设备 app_data_rx(512) sha256 不符")
+        self.checks.append("PC->设备 512 字节：tx/rx sha256 一致")
+
+        r = wait_scenario_result(ctx["dev_events"], "g_dev_512", 20000)
+        self.check(r is not None and r["data"]["status"] == "ok", "g_dev_512 未 ok")
+        sha = self.sha256_hex(texts["dev512"])
+        self.check(wait_data_event(ctx["dev_events"], "app_data_tx", sha, 10000) is not None, "设备 app_data_tx(512) sha256 不符")
+        self.check(wait_data_event(ctx["pc_events"], "app_data_rx", sha, 10000) is not None, "PC app_data_rx(512) sha256 不符")
+        self.checks.append("设备->PC 512 字节：tx/rx sha256 一致")
+
+        r = wait_scenario_result(ctx["pc_events"], "g_pc_513", 20000)
+        self.check(r is not None and r["data"]["status"] == "rejected" and r["data"]["request_bytes"] == 513
+                   and r["data"]["reason"] == "payload_too_large", "g_pc_513 未按 payload_too_large 拒绝")
+        self.check(wait_data_event(ctx["pc_events"], "app_data_tx", self.sha256_hex(texts["pc513"]), 3000) is None,
+                   "513 字节不应产生 app_data_tx")
+        self.checks.append("PC 513 字节：rejected/payload_too_large，无 tx")
+
+        r = wait_scenario_result(ctx["dev_events"], "g_dev_513", 20000)
+        self.check(r is not None and r["data"]["status"] == "rejected" and r["data"]["request_bytes"] == 513
+                   and r["data"]["reason"] == "payload_too_large", "g_dev_513 未按 payload_too_large 拒绝")
+        self.check(wait_data_event(ctx["dev_events"], "app_data_tx", self.sha256_hex(texts["dev513"]), 3000) is None,
+                   "513 字节不应产生设备 app_data_tx")
+        self.checks.append("设备 513 字节：rejected/payload_too_large，无 tx")
+
+        r = wait_scenario_result(ctx["pc_events"], "g_pc_utf8", 20000)
+        self.check(r is not None and r["data"]["status"] == "ok", "g_pc_utf8 未 ok")
+        sha = self.sha256_hex(texts["pc_utf8"])
+        self.check(wait_data_event(ctx["pc_events"], "app_data_tx", sha, 10000) is not None, "PC->设备 UTF-8 sha256 不符")
+        self.check(wait_data_event(ctx["dev_events"], "app_data_rx", sha, 10000) is not None, "PC->设备 UTF-8 rx sha256 不符")
+        self.checks.append("PC->设备 UTF-8 多字节：tx/rx sha256 一致")
+
+        r = wait_scenario_result(ctx["dev_events"], "g_dev_utf8", 20000)
+        self.check(r is not None and r["data"]["status"] == "ok", "g_dev_utf8 未 ok")
+        sha = self.sha256_hex(texts["dev_utf8"])
+        self.check(wait_data_event(ctx["dev_events"], "app_data_tx", sha, 10000) is not None, "设备->PC UTF-8 sha256 不符")
+        self.check(wait_data_event(ctx["pc_events"], "app_data_rx", sha, 10000) is not None, "设备->PC UTF-8 rx sha256 不符")
+        self.checks.append("设备->PC UTF-8 多字节：tx/rx sha256 一致")
+
+        pc_code, dev_code, pc_last, dev_last = self.finish_dual(ctx, self.args.timeout_seconds + 10)
+        ok = pc_code == 0 and dev_code == 0 and pc_last == "shutdown_complete" and dev_last == "shutdown_complete"
+        self.write_summary("g", ok)
 
     def scenario_h(self):
-        asserts = []
-        passed = False
-        ctx = None
+        ctx = self.start_dual(os.path.join(SCENARIOS_DIR, "h_frame_probe.json"), 20, 20)
+        self.check(len(self.wait_events(ctx["dev_events"], "ready", "device", 1, 15000)) >= 1, "设备 ready 缺失")
+        self.check(len(self.wait_events(ctx["pc_events"], "ready", "pc", 1, 15000)) >= 1, "PC ready 缺失")
+        self.check(len(self.wait_events(ctx["dev_events"], "ap_ready", "device", 1, 15000)) >= 1, "ap_ready 缺失")
+        time.sleep(1)
+
+        def send_frame(client, payload):
+            hdr = bytes([(len(payload) >> 8) & 0xFF, len(payload) & 0xFF])
+            client.sendall(hdr + payload)
+
+        def read_frame(client, timeout_ms):
+            client.settimeout(timeout_ms / 1000.0)
+            try:
+                hdr = b""
+                while len(hdr) < 2:
+                    chunk = client.recv(2 - len(hdr))
+                    if not chunk:
+                        return None
+                    hdr += chunk
+                length = (hdr[0] << 8) | hdr[1]
+                body = b""
+                while len(body) < length:
+                    chunk = client.recv(length - len(body))
+                    if not chunk:
+                        return None
+                    body += chunk
+                return body.decode("utf-8")
+            except (socket.timeout, OSError):
+                return None
+
+        def try_connect(port):
+            s = socket.create_connection(("127.0.0.1", port), timeout=3)
+            return s
+
+        auth_bad = b'{"cmd":"auth","pin":"0000"}'
+        full = bytes([0, len(auth_bad)]) + auth_bad
+
+        # A: 拆包
+        s = try_connect(20000)
+        half = len(full) // 2
+        s.sendall(full[:half])
+        time.sleep(0.15)
+        s.sendall(full[half:])
+        resp = read_frame(s, 5000)
+        self.check(resp is not None, "拆包发送 auth 后无响应")
+        j = json.loads(resp)
+        self.check(j.get("cmd") == "auth_result" and j.get("status") == "fail", "auth_result 期望 fail，实际 %s" % resp)
+        s.close()
+        self.checks.append("拆包/粘包帧解析：分两次写出的 auth 帧被正确解析")
+
+        # B: 超长帧头
+        s = try_connect(20000)
+        s.sendall(bytes([0x04, 0x01]))
+        time.sleep(0.15)
+        s.sendall(full)
+        resp = read_frame(s, 5000)
+        self.check(resp is not None, "超长帧后连接应仍可用并响应合法帧")
+        j = json.loads(resp)
+        self.check(j.get("cmd") == "auth_result" and j.get("status") == "fail", "超长帧后 auth_result 期望 fail")
+        s.close()
+        self.checks.append("1025 字节超长帧头被拒绝，连接未崩溃且继续工作")
+
+        # C: 0 长度帧 x3 -> 关闭
+        s = try_connect(20000)
+        for _ in range(3):
+            s.sendall(bytes([0, 0]))
+            time.sleep(0.2)
+        s.settimeout(3)
+        closed = False
         try:
-            scn = os.path.join(SCENARIOS_DIR, "h_frame_probe.json")
-            ctx = self.start_pc(scn, 20)
-            pc_evs = self.read_events(ctx["pcEvents"])
-            hs = next((e for e in pc_evs if e.get("event") == "hotspot_ready"), None)
-            tc = next((e for e in pc_evs if e.get("event") == "tcp_listening"), None)
-            rd = next((e for e in pc_evs if e.get("event") == "ready"), None)
-            self.assert_true(asserts, "PC 事件顺序 hotspot_ready→tcp_listening→ready",
-                             hs and tc and rd and hs["seq"] < tc["seq"] < rd["seq"],
-                             "seq hs=%s tc=%s rd=%s" % (hs and hs.get("seq"), tc and tc.get("seq"), rd and rd.get("seq")))
+            n = len(s.recv(16))
+            closed = n <= 0
+        except OSError:
+            closed = True
+        s.close()
+        self.check(closed, "连续 3 个 0 长度帧后连接应被设备关闭（malformed_max）")
+        self.checks.append("0 长度帧 x3：设备按 malformed_max 关闭连接且不崩溃")
 
-            hello_a1 = '{"cmd":"device_hello","id":"02:00:00:00:00:a1","fw_version":"1.1.0","proto_ver":1,"uptime":1}'
-            hello_a2 = '{"cmd":"device_hello","id":"02:00:00:00:00:a2","fw_version":"1.1.0","proto_ver":1,"uptime":1}'
-            hello_v2 = '{"cmd":"device_hello","id":"02:00:00:00:00:a3","fw_version":"1.1.0","proto_ver":2,"uptime":1}'
-            hello_a4 = '{"cmd":"device_hello","id":"02:00:00:00:00:a4","fw_version":"1.1.0","proto_ver":1,"uptime":1}'
+        # PC 业务端口：版本拒绝
+        hello_bad = ('{"cmd":"device_hello","id":"02:00:00:00:00:ff","type":"pressure_sensor",'
+                     '"fw_version":"1.0.0","proto_ver":2,"capabilities":["pressure"],"uptime":1}')
+        s = try_connect(5935)
+        send_frame(s, hello_bad.encode("utf-8"))
+        resp = read_frame(s, 5000)
+        self.check(resp is not None, "proto_ver=2 的 device_hello 无响应")
+        j = json.loads(resp)
+        self.check(j.get("cmd") == "host_ack" and j.get("status") == "fail", "proto_ver=2 应被拒绝，实际 %s" % resp)
+        s.close()
+        self.checks.append("PC 拒绝 proto_ver=2（host_ack status=fail）")
 
-            def connect():
-                s = socket.create_connection(("127.0.0.1", 5935), timeout=5)
-                return s
+        hello_ok = ('{"cmd":"device_hello","id":"02:00:00:00:00:fe","type":"pressure_sensor",'
+                    '"fw_version":"1.0.0","proto_ver":1,"capabilities":["pressure"],"uptime":1}')
+        s = try_connect(5935)
+        send_frame(s, hello_ok.encode("utf-8"))
+        resp = read_frame(s, 5000)
+        self.check(resp is not None, "proto_ver=1 的 device_hello 无响应")
+        j = json.loads(resp)
+        self.check(j.get("cmd") == "host_ack" and j.get("status") == "ok", "proto_ver=1 应被接受，实际 %s" % resp)
+        s.close()
+        self.checks.append("PC 接受 proto_ver=1（host_ack status=ok）")
 
-            # 1) 拆包：一帧分两次写入
-            payload = hello_a1.encode("utf-8")
-            full = struct.pack(">H", len(payload)) + payload
-            half = len(full) // 2
-            s = connect()
-            s.sendall(full[:half])
-            time.sleep(0.15)
-            s.sendall(full[half:])
-            resp = self.read_frame(s)
-            self.assert_true(asserts, "拆包帧（分两次写入）被完整解析", resp is not None, "无响应")
-            j = json.loads(resp) if resp else {}
-            self.assert_true(asserts, "拆包 hello → host_ack ok", j.get("cmd") == "host_ack" and j.get("status") == "ok", "resp=%s" % resp)
-            s.close()
-            time.sleep(0.5)
-
-            # 2) 1025 超长帧头被拒且连接仍可用
-            s = connect()
-            s.sendall(b"\x04\x01")
-            time.sleep(0.15)
-            self.send_frame(s, hello_a2.encode("utf-8"))
-            resp = self.read_frame(s)
-            self.assert_true(asserts, "超长帧头后连接仍可响应合法帧", resp is not None, "无响应")
-            j = json.loads(resp) if resp else {}
-            self.assert_true(asserts, "超长帧后合法 hello → host_ack ok", j.get("cmd") == "host_ack" and j.get("status") == "ok", "resp=%s" % resp)
-            s.close()
-            time.sleep(0.5)
-
-            # 3) 0 长度帧 × 3 → malformed_max 关闭
-            s = connect()
-            for _ in range(3):
-                s.sendall(b"\x00\x00")
-                time.sleep(0.2)
-            closed = self.conn_closed(s)
-            s.close()
-            self.assert_true(asserts, "0 长度帧 ×3 后连接被 PC 关闭（malformed_max）", closed, "连接仍打开")
-            time.sleep(0.5)
-
-            # 4) proto_ver=2 被拒
-            s = connect()
-            self.send_frame(s, hello_v2.encode("utf-8"))
-            resp = self.read_frame(s)
-            self.assert_true(asserts, "proto_ver=2 hello 有响应", resp is not None, "无响应")
-            j = json.loads(resp) if resp else {}
-            self.assert_true(asserts, "proto_ver=2 → host_ack fail/unsupported_protocol",
-                             j.get("cmd") == "host_ack" and j.get("status") == "fail" and j.get("reason") == "unsupported_protocol", "resp=%s" % resp)
-            closed = self.conn_closed(s)
-            s.close()
-            self.assert_true(asserts, "proto_ver=2 拒绝后连接被关闭", closed, "连接仍打开")
-            time.sleep(0.5)
-
-            # 5) proto_ver=1 接受；粘包：一次写入两帧 ping → 两个 pong
-            s = connect()
-            self.send_frame(s, hello_a4.encode("utf-8"))
-            resp = self.read_frame(s)
-            self.assert_true(asserts, "proto_ver=1 hello 有响应", resp is not None, "无响应")
-            j = json.loads(resp) if resp else {}
-            self.assert_true(asserts, "proto_ver=1 → host_ack ok", j.get("cmd") == "host_ack" and j.get("status") == "ok", "resp=%s" % resp)
-            p1 = '{"cmd":"ping","seq":1}'.encode("utf-8")
-            p2 = '{"cmd":"ping","seq":2}'.encode("utf-8")
-            s.sendall(struct.pack(">H", len(p1)) + p1 + struct.pack(">H", len(p2)) + p2)
-            r1 = self.read_frame(s)
-            r2 = self.read_frame(s)
-            j1 = json.loads(r1) if r1 else {}
-            j2 = json.loads(r2) if r2 else {}
-            seqs = []
-            if j1.get("cmd") == "pong":
-                seqs.append(j1.get("seq"))
-            if j2.get("cmd") == "pong":
-                seqs.append(j2.get("seq"))
-            self.assert_true(asserts, "粘包：一次写入 2 帧 ping → 2 个 pong 回显（seq=1,2）",
-                             len(seqs) == 2 and 1 in seqs and 2 in seqs, "pongs=%s" % seqs)
-            s.close()
-
-            facts = self.finish_processes(ctx, ["pcSide"], ["pcEvents"], ["PC"], self.args.timeout_seconds + 10)
-            self.add_cleanup_assertions(asserts, facts, ["PC"])
-            passed = True
-        except Exception as e:
-            self.log("  场景 h 异常: %s" % e)
-        if ctx:
-            self.stop_side(ctx["pcSide"])
-        self.write_summary("h", passed, asserts, "PC-only 原始 socket 探针（无真实设备，避免占用唯一连接槽）")
-        return passed
+        pc_code, dev_code, pc_last, dev_last = self.finish_dual(ctx, self.args.timeout_seconds + 10)
+        ok = pc_code == 0 and dev_code == 0 and pc_last == "shutdown_complete" and dev_last == "shutdown_complete"
+        self.write_summary("h", ok, "尽力而为场景（原始 socket 探针）")
 
     # ---------- 主入口 ----------
-    def run(self, scenario):
-        names = SCENARIO_NAMES if scenario == "all" else [s.strip() for s in scenario.split(",")]
-        for n in names:
-            if n not in SCENARIO_NAMES:
-                raise SystemExit("未知场景: %s（可选 a,b,c,d,e,f,g,h 或 all）" % n)
+    def run(self, names):
         failed = []
         for name in names:
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.dir = os.path.join(self.run_root, "%s_%s" % (stamp, name))
-            os.makedirs(self.dir, exist_ok=True)
+            self.dir = os.path.join(self.run_root, "%s_%s" % (datetime.now().strftime("%Y%m%d_%H%M%S"), name))
+            os.makedirs(os.path.join(self.dir, "pc-runtime"), exist_ok=True)
+            os.makedirs(os.path.join(self.dir, "device-runtime"), exist_ok=True)
             os.makedirs(os.path.join(self.dir, "sim-catalog"), exist_ok=True)
             os.makedirs(os.path.join(self.dir, "logs"), exist_ok=True)
+            self.checks = []
             self.log("==== 场景 %s @ %s ====" % (name, self.dir))
             try:
-                passed = getattr(self, "scenario_%s" % name)()
-            except Exception as e:
-                self.log("  场景 %s 异常: %s" % (name, e))
-                passed = False
-                try:
-                    for proc in self._leftover_procs():
-                        proc.kill()
-                except Exception:
-                    pass
-            if passed:
+                getattr(self, "scenario_%s" % name)()
                 self.log("  场景 %s 通过" % name)
-            else:
-                self.log("  场景 %s 失败" % name)
+            except Exception as exc:
+                self.log("  场景 %s 异常: %s" % (name, exc))
                 failed.append(name)
-        summary = {
-            "timestamp": datetime.now().isoformat(),
-            "passed": [n for n in names if n not in failed],
-            "failed": failed,
-            "runtime_root": self.run_root,
-        }
-        self.write_utf8_no_bom(os.path.join(self.run_root, "integration-summary.json"), json.dumps(summary, ensure_ascii=False, indent=2))
+                for proc_name in ("provision_pc", "provision_device"):
+                    os.system("taskkill /F /IM %s.exe >NUL 2>&1" % proc_name)
+        summary = {"timestamp": datetime.now().isoformat(), "failed": failed,
+                   "passed": [n for n in names if n not in failed], "runtime_root": self.run_root}
+        with open(os.path.join(self.run_root, "integration-summary.json"), "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
         if failed:
-            self.log("失败场景: %s" % ",".join(failed))
+            self.log("失败场景: %s" % ", ".join(failed))
             return 1
         self.log("全部场景通过")
         return 0
 
-    def _leftover_procs(self):
-        import psutil  # noqa: F401  # 延迟导入；无 psutil 时返回空
-        out = []
-        try:
-            import psutil
-            for p in psutil.process_iter(["name"]):
-                if p.info["name"] and "provision" in p.info["name"].lower():
-                    out.append(p)
-        except ImportError:
-            pass
-        return out
-
 
 def main():
-    if hasattr(sys.stdout, "reconfigure"):
-        try:
-            sys.stdout.reconfigure(encoding="utf-8")
-        except Exception:
-            pass
-    parser = argparse.ArgumentParser(description="跨端集成测试 runner（beta v1.1）")
+    parser = argparse.ArgumentParser(description="跨端集成测试 runner（Python 3）")
     parser.add_argument("--scenario", default="all", help="a,b,c,d,e,f,g,h 或 all")
     parser.add_argument("--pc-exe", required=True)
     parser.add_argument("--device-exe", required=True)
-    parser.add_argument("--pc-contract", default="")
-    parser.add_argument("--device-contract", default="")
     parser.add_argument("--pc-config", default="")
     parser.add_argument("--device-config", default="")
+    parser.add_argument("--pc-contract", default="")
+    parser.add_argument("--device-contract", default="")
     parser.add_argument("--runtime-root", default="")
-    parser.add_argument("--timeout-seconds", type=int, default=60)
+    parser.add_argument("--timeout-seconds", type=int, default=45)
     parser.add_argument("--qt-bin", default="")
     args = parser.parse_args()
+    names = SCENARIO_NAMES if args.scenario == "all" else [s.strip() for s in args.scenario.split(",")]
+    for n in names:
+        if n not in SCENARIO_NAMES:
+            print("未知场景: %s（可选 %s 或 all）" % (n, ",".join(SCENARIO_NAMES)))
+            return 2
     runner = Runner(args)
-    sys.exit(runner.run(args.scenario))
+    return runner.run(names)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

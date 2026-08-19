@@ -12,8 +12,6 @@
 #include "params.h"
 #include "host_registry.h"
 
-/* beta v1.1：固定一对一 TCP 服务（设计文档 8.2）。在线 + pending 总数 ≤ PROTO_HOST_MAX_CONN，
- * 第二连接回复 host_ack busy reason=single_device_only 后关闭。 */
 class HostTcpServer {
 public:
     HostTcpServer(net_ctx_t *net, HostRegistry &reg, const demo_params_t &params);
@@ -26,6 +24,8 @@ public:
     /* UI 线程调用：入队一条联调消息，由 Poll 在 host 线程冲刷发送。
      * 返回 DEMO_OK=已入队；DEMO_ERR=id/text 为空或 text 超 APP_DATA_TEXT_MAX */
     int QueueAppData(const std::string &device_id, const std::string &text);
+    void SetBusyOverride(int limit); /* <0 恢复 */
+    int BusyOverride() const { return busy_override_; }
 
 private:
     struct PendingConn {
@@ -40,13 +40,12 @@ private:
     void FlushPendingTx();
     int SendFrame(void *sock, cJSON *obj);
     std::string NewSessionId();
-    void RejectBusy(void *conn);
-    int ActiveConnCount() const; /* 在线(conn!=null) + pending */
 
     net_ctx_t *net_;
     HostRegistry &reg_;
     const demo_params_t &params_;
     void *listen_ = nullptr;
+    int busy_override_ = -1;
     std::vector<PendingConn> pending_;
     std::map<void *, std::vector<uint8_t>> conn_rx_; /* 已注册连接收包缓冲（按句柄隔离） */
     std::mutex tx_mu_;

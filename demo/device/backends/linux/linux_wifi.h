@@ -11,6 +11,7 @@
  * 仅 Linux 下编译；Windows 平台不编译本模块（见 CMakeLists）。
  */
 
+#include "linux_hotspot.h"
 #include "net_abstraction.h"
 
 #include <stddef.h>
@@ -33,12 +34,12 @@ typedef struct linux_wifi linux_wifi_t;
 
 /*
  * 创建 STA 实例：
- * - sta_interface 直接指定 STA 网卡名；为 NULL/空时回退 "wlP2p33s0"。
- *   beta v1.1 解耦：不再依赖 linux_hotspot_t（纯 STA 后端普通用户即可创建）；
+ * - hotspot 由调用方创建并保证存活至 wifi 销毁之后；STA 网卡名取自
+ *   linux_hotspot_sta_interface(hotspot)；
  * - ops_override 非 NULL 时用于替换命令执行（仅供测试）。
  * 失败时 *out 置 NULL。
  */
-int linux_wifi_create(linux_wifi_t **out, const char *sta_interface,
+int linux_wifi_create(linux_wifi_t **out, linux_hotspot_t *hotspot,
                       const linux_wifi_ops_t *ops_override);
 
 void linux_wifi_destroy(linux_wifi_t *wifi);

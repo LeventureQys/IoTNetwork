@@ -16,9 +16,13 @@ struct AppDataTest : ::testing::Test {
     void TearDown() override { CleanDir(dir); }
 };
 
-/* 默认假后端（扫描返回 Modu_PC + 固定 TCP）自动进入 SESSION，无需预置凭据 */
+/* 预置已确认凭据 + announce，等待进入 SESSION 状态 */
 static device_host_t *StartSessionHost(const std::string &dir)
 {
+    fake_backend_set_announce(1);
+    PreseedCreds(dir, 0,
+                 "{\"schema\":1,\"creds\":[{\"ssid\":\"TactileFactory-2.4G\","
+                 "\"password\":\"securepass123\",\"confirmed\":1}]}");
     std::string cfg_path;
     device_host_options_t o = MakeOptions(dir, &cfg_path);
     device_host_t *h = CreateHost(o);
@@ -58,13 +62,13 @@ TEST_F(AppDataTest, NotRunningInvalidState)
 
 TEST_F(AppDataTest, NotSessionInvalidState)
 {
-    fake_backend_set_no_ap(1); /* 无目标热点 → 停留在 WIFI_SCAN */
     std::string cfg_path;
     device_host_options_t o = MakeOptions(dir, &cfg_path);
     device_host_t *h = CreateHost(o);
     device_error_t e;
     ASSERT_EQ(device_host_start(h, &e), DEVICE_OK);
-    EXPECT_TRUE(WaitDeviceState(h, DEV_STATE_WIFI_SCAN, 10000));
+    /* 无凭据 → 停在配网/引导阶段，非会话态拒绝 */
+    EXPECT_TRUE(WaitDeviceState(h, DEV_STATE_AP_PROVISION, 10000));
     EXPECT_EQ(device_host_send_app_data(h, "hi", 2, &e), DEVICE_ERR_INVALID_STATE);
     EXPECT_EQ(device_host_request_stop(h), DEVICE_OK);
     EXPECT_EQ(device_host_join(h, 5000, &e), DEVICE_OK);

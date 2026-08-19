@@ -1,5 +1,6 @@
-#include "device_linux_backend.h"
+﻿#include "device_linux_backend.h"
 
+#include "linux_hotspot.h"
 #include "linux_nvs.h"
 #include "linux_socket.h"
 #include "linux_wifi.h"
@@ -13,10 +14,12 @@
 
 #define TAG "LINUX_BACKEND"
 
+#define LINUX_JSON_DEFAULT_HOTSPOT_PATH "config/linux_hotspot.json"
 #define LINUX_JSON_DEFAULT_NVS_FILE "run/device_linux.nvs.json"
 
 typedef struct linux_backend {
     linux_wifi_t *wifi;
+    linux_hotspot_t *hotspot;
     linux_nvs_t *nvs;
 } linux_backend_t;
 
@@ -25,6 +28,7 @@ typedef struct linux_backend {
 typedef struct linux_backend_config {
     int enable;
     char sta_interface[32];
+    char hotspot_config_path[128];
     char nvs_file[384];
 } linux_backend_config_t;
 
@@ -32,6 +36,8 @@ static void linux_backend_config_defaults(linux_backend_config_t *config)
 {
     memset(config, 0, sizeof(*config));
     config->enable = 1;
+    snprintf(config->hotspot_config_path, sizeof(config->hotspot_config_path),
+             "%s", LINUX_JSON_DEFAULT_HOTSPOT_PATH);
     snprintf(config->nvs_file, sizeof(config->nvs_file), "%s",
              LINUX_JSON_DEFAULT_NVS_FILE);
 }
@@ -96,6 +102,13 @@ static void linux_backend_config_load(linux_backend_config_t *config,
     else if (item != NULL)
         snprintf(config->sta_interface, sizeof(config->sta_interface), "%s",
                  item->valuestring);
+
+    item = cJSON_GetObjectItemCaseSensitive(root, "hotspot_config_path");
+    if (item != NULL && (!cJSON_IsString(item) || item->valuestring == NULL))
+        LOG_W(TAG, "字段 hotspot_config_path 类型非法，忽略");
+    else if (item != NULL)
+        snprintf(config->hotspot_config_path, sizeof(config->hotspot_config_path),
+                 "%s", item->valuestring);
 
     item = cJSON_GetObjectItemCaseSensitive(root, "nvs_file");
     if (item != NULL && (!cJSON_IsString(item) || item->valuestring == NULL))
@@ -175,18 +188,13 @@ static int lb_wifi_sta_disconnect(void *user)
 static int lb_wifi_ap_start(void *user, const char *ssid, const char *password,
                             const char *pin)
 {
-    (void)user;
-    (void)ssid;
-    (void)password;
     (void)pin;
-    /* beta v1.1：设备不再创建热点；纯 STA 实例对 AP 操作 fail-closed。 */
-    return DEMO_ERR;
+    return linux_hotspot_start(((linux_backend_t *)user)->hotspot, ssid, password);
 }
 
 static int lb_wifi_ap_stop(void *user)
 {
-    (void)user;
-    return DEMO_ERR;
+    return linux_hotspot_stop(((linux_backend_t *)user)->hotspot);
 }
 
 static int lb_wifi_get_rssi(void *user, int *rssi)
@@ -353,6 +361,7 @@ static void linux_backend_destroy_user(void *user)
         return;
     linux_wifi_destroy(backend->wifi);
     linux_nvs_destroy(backend->nvs);
+    linux_hotspot_destroy(backend->hotspot);
     free(backend);
 }
 
@@ -365,9 +374,11 @@ device_result_t device_linux_backend_create(
 {
     linux_backend_t *backend = NULL;
     linux_backend_config_t config;
+    const char *hotspot_config_path;
     const char *nvs_file;
     const char *sta_interface;
     unsigned int device_index = 0;
+    char create_error[256];
     device_result_t result_code = DEVICE_OK;
     int result;
 
@@ -389,6 +400,10 @@ device_result_t device_linux_backend_create(
     if (options != NULL)
         linux_backend_config_load(&config, options->config_path);
 
+    hotspot_config_path = config.hotspot_config_path;
+    if (options != NULL && options->hotspot_config_path != NULL &&
+        options->hotspot_config_path[0] != '\0')
+        hotspot_config_path = options->hotspot_config_path;
     nvs_file = config.nvs_file;
     if (options != NULL && options->nvs_file != NULL && options->nvs_file[0] != '\0')
         nvs_file = options->nvs_file;
@@ -412,8 +427,16 @@ device_result_t device_linux_backend_create(
         return DEVICE_ERR_NO_MEMORY;
     }
 
-    /* beta v1.1：纯 STA 后端不创建需要 root 的 hotspot 实例，
-     * 普通用户仅需 nmcli/网卡权限即可创建。 */
+    create_error[0] = '\0';
+    result = linux_hotspot_create(&backend->hotspot, hotspot_config_path, NULL,
+                                  sta_interface, create_error, sizeof(create_error));
+    if (result != DEMO_OK) {
+        result_code = map_create_error(result, create_error);
+        LOG_E(TAG, "%s", create_error[0] != '\0' ? create_error : "热点创建失败");
+        set_backend_error(error, result_code, "device_linux_backend_create",
+                          create_error[0] != '\0' ? create_error : "热点初始化失败");
+        goto fail;
+    }
     result = linux_nvs_create(&backend->nvs, nvs_file);
     if (result != DEMO_OK) {
         result_code = map_create_error(result, NULL);
@@ -421,7 +444,7 @@ device_result_t device_linux_backend_create(
                           "文件 NVS 初始化失败");
         goto fail;
     }
-    result = linux_wifi_create(&backend->wifi, sta_interface, NULL);
+    result = linux_wifi_create(&backend->wifi, backend->hotspot, NULL);
     if (result != DEMO_OK) {
         result_code = map_create_error(result, NULL);
         set_backend_error(error, result_code, "device_linux_backend_create",

@@ -121,42 +121,57 @@ int dev_index_of_tag(const char *tag)
     return idx;
 }
 
-std::filesystem::path hotspot_catalog_path(const demo_params_t &params)
+std::filesystem::path ap_catalog_dir(const demo_params_t &params)
 {
     if (params.sim_catalog_dir[0] != '\0')
-        return std::filesystem::path(params.sim_catalog_dir) / "pc-hotspot.json";
-    return std::filesystem::path("run") / "ap_catalog" / "pc-hotspot.json";
+        return std::filesystem::path(params.sim_catalog_dir);
+    return std::filesystem::path("run") / "ap_catalog";
 }
 
-static int current_pid()
+/* ---- AP catalog（新契约：device-<index>.json） ---- */
+
+static bool is_valid_ipv4(const char *ip)
 {
+    if (ip == NULL || ip[0] == '\0')
+        return false;
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    char tail = '\0';
+    if (sscanf(ip, "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) != 4)
+        return false;
+    return a <= 255 && b <= 255 && c <= 255 && d <= 255;
+}
+
+static bool pid_alive(int pid)
+{
+    if (pid <= 0)
+        return false;
 #ifdef _WIN32
-    return (int)GetCurrentProcessId();
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
+    if (h == NULL)
+        return false;
+    DWORD exit_code = 0;
+    BOOL ok = GetExitCodeProcess(h, &exit_code);
+    CloseHandle(h);
+    return ok && exit_code == STILL_ACTIVE;
 #else
-    return (int)getpid();
+    if (kill(pid, 0) == 0)
+        return true;
+    return errno == EPERM;
 #endif
 }
 
-static uint64_t now_ms()
-{
-    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
-
-/* ---- schema2 pc-hotspot.json 发布 ---- */
-
-static long long hotspot_owner_pid(const std::filesystem::path &path)
+/* 读取单个 catalog 文件；损坏/缺字段/越界返回 false（由调用方警告） */
+bool ap_record_read(const std::filesystem::path &path, sim_ap_record_t *out)
 {
     FILE *file = fopen(path.string().c_str(), "rb");
     if (!file)
-        return -1;
+        return false;
     fseek(file, 0, SEEK_END);
     long size = ftell(file);
     fseek(file, 0, SEEK_SET);
     if (size <= 0 || size > 4096) {
         fclose(file);
-        return -1;
+        return false;
     }
     std::string text((size_t)size, '\0');
     size_t read_size = fread(&text[0], 1, text.size(), file);
@@ -164,67 +179,62 @@ static long long hotspot_owner_pid(const std::filesystem::path &path)
     text.resize(read_size);
     cJSON *root = cJSON_Parse(text.c_str());
     if (!root)
-        return -1;
-    const cJSON *owner = cJSON_GetObjectItemCaseSensitive(root, "owner_pid");
-    long long pid = cJSON_IsNumber(owner) ? (long long)cJSON_GetNumberValue(owner) : -1;
-    cJSON_Delete(root);
-    return pid;
-}
+        return false;
 
-static int publish_hotspot_file(const demo_params_t &params, const char *ssid,
-                                const char *password)
-{
-    std::filesystem::path target = hotspot_catalog_path(params);
-    std::error_code error;
-    std::filesystem::create_directories(target.parent_path(), error);
-    if (error)
-        return DEMO_ERR;
-    std::filesystem::path tmp = target;
-    tmp += ".tmp-" + std::to_string(current_pid());
+    const cJSON *schema = cJSON_GetObjectItemCaseSensitive(root, "schema");
+    const cJSON *device_index = cJSON_GetObjectItemCaseSensitive(root, "device_index");
+    const cJSON *device_id = cJSON_GetObjectItemCaseSensitive(root, "device_id");
+    const cJSON *ssid = cJSON_GetObjectItemCaseSensitive(root, "ssid");
+    const cJSON *bssid = cJSON_GetObjectItemCaseSensitive(root, "bssid");
+    const cJSON *logical_ip = cJSON_GetObjectItemCaseSensitive(root, "logical_ip");
+    const cJSON *loopback_host = cJSON_GetObjectItemCaseSensitive(root, "loopback_host");
+    const cJSON *provision_port = cJSON_GetObjectItemCaseSensitive(root, "provision_port");
+    const cJSON *published_at_ms = cJSON_GetObjectItemCaseSensitive(root, "published_at_ms");
+    const cJSON *owner_pid = cJSON_GetObjectItemCaseSensitive(root, "owner_pid");
 
-    cJSON *root = cJSON_CreateObject();
-    if (!root)
-        return DEMO_ERR_NOMEM;
-    cJSON_AddNumberToObject(root, "schema", 2);
-    cJSON_AddStringToObject(root, "ssid", ssid ? ssid : "");
-    cJSON_AddStringToObject(root, "password", password ? password : "");
-    cJSON_AddStringToObject(root, "logical_gateway", PROTO_PC_AP_IP);
-    cJSON_AddNumberToObject(root, "prefix_length", 24);
-    cJSON_AddNumberToObject(root, "tcp_port", params.host_tcp_port);
-    cJSON_AddStringToObject(root, "loopback_host", "127.0.0.1");
-    cJSON_AddNumberToObject(root, "loopback_port", params.host_tcp_port);
-    cJSON_AddNumberToObject(root, "owner_pid", current_pid());
-    cJSON_AddNumberToObject(root, "published_at_ms", (double)now_ms());
-    char *text = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    if (!text)
-        return DEMO_ERR_NOMEM;
-
-    FILE *file = fopen(tmp.string().c_str(), "wb");
-    if (!file) {
-        free(text);
-        return DEMO_ERR;
+    bool ok = cJSON_IsNumber(schema) && cJSON_IsNumber(device_index) &&
+              cJSON_IsString(device_id) && cJSON_IsString(ssid) &&
+              cJSON_IsString(bssid) && cJSON_IsString(logical_ip) &&
+              cJSON_IsString(loopback_host) && cJSON_IsNumber(provision_port) &&
+              cJSON_IsNumber(published_at_ms) && cJSON_IsNumber(owner_pid);
+    if (ok) {
+        if (schema->valueint != 1)
+            ok = false;
+        if (device_index->valueint < 0 || device_index->valueint > 15)
+            ok = false;
+        if (provision_port->valueint < 1 || provision_port->valueint > 65535)
+            ok = false;
+        if (!is_valid_ipv4(logical_ip->valuestring) ||
+            !is_valid_ipv4(loopback_host->valuestring))
+            ok = false;
+        if (ssid->valuestring[0] == '\0' || device_id->valuestring[0] == '\0')
+            ok = false;
+        /* 时效：>30 秒且 owner_pid 已不存在 → 过期（published_at_ms 使用 int64 语义） */
+        {
+            long long published = (long long)cJSON_GetNumberValue(published_at_ms);
+            if (published > 0) {
+                uint64_t now = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count();
+                uint64_t age_ms = now - (uint64_t)published;
+                if (age_ms > 30000u && !pid_alive((int)cJSON_GetNumberValue(owner_pid)))
+                    ok = false;
+            }
+        }
     }
-    fwrite(text, 1, strlen(text), file);
-    fclose(file);
-    free(text);
-
-    std::filesystem::rename(tmp, target, error);
-    if (error) {
-        std::filesystem::remove(tmp, error);
-        return DEMO_ERR;
+    if (ok && out) {
+        memset(out, 0, sizeof(*out));
+        snprintf(out->ssid, sizeof(out->ssid), "%s", ssid->valuestring);
+        snprintf(out->device_id, sizeof(out->device_id), "%s", device_id->valuestring);
+        snprintf(out->logical_ip, sizeof(out->logical_ip), "%s", logical_ip->valuestring);
+        snprintf(out->loopback_host, sizeof(out->loopback_host), "%s", loopback_host->valuestring);
+        out->real_port = (uint16_t)cJSON_GetNumberValue(provision_port);
+        /* 新契约不发布密码/PIN：PC 模拟设备热点使用固定演示凭据 */
+        snprintf(out->password, sizeof(out->password), "%s", "modutech_leventure");
+        snprintf(out->pin, sizeof(out->pin), "%s", "5935");
     }
-    return DEMO_OK;
-}
-
-static void delete_hotspot_file_if_owned(const demo_params_t &params)
-{
-    std::filesystem::path target = hotspot_catalog_path(params);
-    std::error_code error;
-    if (!std::filesystem::exists(target, error))
-        return;
-    if (hotspot_owner_pid(target) == (long long)current_pid())
-        std::filesystem::remove(target, error);
+    cJSON_Delete(root);
+    return ok;
 }
 
 /* ---------------- SimBackend 实例 ---------------- */
@@ -270,6 +280,23 @@ public:
             }
             n++;
         }
+        sim_ap_record_t records[16];
+        int record_count = sim_backend_ap_list(&params_, records, 16);
+        for (int i = 0; i < record_count; ++i) {
+            bool duplicate = false;
+            for (int existing = 0; existing < n && existing < cap; ++existing)
+                if (strcmp(aps[existing].ssid, records[i].ssid) == 0)
+                    duplicate = true;
+            if (duplicate)
+                continue;
+            if (n < cap) {
+                memset(&aps[n], 0, sizeof(aps[n]));
+                snprintf(aps[n].ssid, sizeof(aps[n].ssid), "%s", records[i].ssid);
+                aps[n].rssi = -50;
+                aps[n].band_2g = 1;
+            }
+            n++;
+        }
         if (w.TargetUp()) {
             if (n < cap) {
                 memset(&aps[n], 0, sizeof(aps[n]));
@@ -287,6 +314,9 @@ public:
     {
         SimWorld &w = SimWorld::Instance();
         int r = w.StaConnect(ssid, pass);
+        sim_ap_record_t record;
+        if (r != 0 && sim_backend_ap_find(&params_, ssid, &record) == DEMO_OK)
+            r = strcmp(record.password, pass) == 0 ? 0 : WIFI_REASON_AUTH_FAIL;
         if (reason) *reason = (wifi_reason_t)r;
         if (r == 0) {
             sta_connected_ = true;
@@ -310,52 +340,24 @@ public:
 
     int WifiApStart(const char *ssid, const char *pass, const char *pin)
     {
-        (void)pin; /* 设计文档 7.1：PIN 参数必须忽略 */
-        if (!ssid || !ssid[0] || !pass || !pass[0])
+        SimWorld &w = SimWorld::Instance();
+        int idx = dev_index();
+        if (idx < 0)
             return DEMO_ERR_INVAL;
-        int rc = publish_hotspot_file(params_, ssid, pass);
-        if (rc != DEMO_OK)
-            return rc;
+        uint16_t real_port = SimWorld::DeviceApRealPort(params_.device_ap_port_base, idx);
+        w.ApRegister(tag_.c_str(), ssid, pass, pin, real_port);
         ap_started_ = true;
         ap_ssid_ = ssid;
-        ap_ipv4_ = PROTO_PC_AP_IP;
-        ap_prefix_ = 24;
-        LOG_I(tag_.c_str(), "PC 热点已启动（模拟），SSID=%s，TCP=%d", ssid, params_.host_tcp_port);
-        return DEMO_OK;
-    }
-
-    int WifiApStatus(net_ap_status_t *status)
-    {
-        if (!status)
-            return DEMO_ERR_INVAL;
-        memset(status, 0, sizeof(*status));
-        if (!ap_started_)
-            return DEMO_ERR;
-        status->started = 1;
-        snprintf(status->ssid, sizeof(status->ssid), "%s", ap_ssid_.c_str());
-        snprintf(status->ipv4, sizeof(status->ipv4), "%s", ap_ipv4_.c_str());
-        status->prefix_length = ap_prefix_;
-        return DEMO_OK;
-    }
-
-    int WifiApConfigureIpv4(const char *ipv4, int prefix_length)
-    {
-        if (!ipv4 || !ipv4[0] || prefix_length <= 0 || prefix_length > 32)
-            return DEMO_ERR_INVAL;
-        if (!ap_started_)
-            return DEMO_ERR;
-        ap_ipv4_ = ipv4;
-        ap_prefix_ = prefix_length;
-        LOG_I(tag_.c_str(), "PC 热点 IP 已配置（模拟）：%s/%d", ipv4, prefix_length);
+        LOG_I(tag_.c_str(), "设备热点已启动（模拟），SSID=%s，实际端口=%u", ssid, real_port);
         return DEMO_OK;
     }
 
     int WifiApStop()
     {
-        delete_hotspot_file_if_owned(params_);
+        SimWorld &w = SimWorld::Instance();
+        w.ApUnregister(tag_.c_str());
         ap_started_ = false;
-        ap_ssid_.clear();
-        LOG_I(tag_.c_str(), "PC 热点已停止（模拟）");
+        LOG_I(tag_.c_str(), "设备热点已停止（模拟）");
         return DEMO_OK;
     }
 
@@ -792,8 +794,9 @@ public:
 
     void CloseAllSockets()
     {
+        SimWorld &w = SimWorld::Instance();
         if (ap_started_) {
-            delete_hotspot_file_if_owned(params_);
+            w.ApUnregister(tag_.c_str());
             ap_started_ = false;
         }
     }
@@ -816,8 +819,6 @@ private:
     std::string sta_ssid_;
     bool ap_started_ = false;
     std::string ap_ssid_;
-    std::string ap_ipv4_ = PROTO_PC_AP_IP;
-    int ap_prefix_ = 24;
     bool ws_ready_ = false;
     bool initialized_ = true;
     int send_fail_skip_ = 0;
@@ -833,8 +834,6 @@ int b_wifi_sta_connect(void *u, const char *s, const char *p, wifi_reason_t *r) 
 int b_wifi_sta_disconnect(void *u) { return self(u)->WifiStaDisconnect(); }
 int b_wifi_ap_start(void *u, const char *s, const char *p, const char *pin) { return self(u)->WifiApStart(s, p, pin); }
 int b_wifi_ap_stop(void *u) { return self(u)->WifiApStop(); }
-int b_wifi_ap_status(void *u, net_ap_status_t *s) { return self(u)->WifiApStatus(s); }
-int b_wifi_ap_configure_ipv4(void *u, const char *ip, int pl) { return self(u)->WifiApConfigureIpv4(ip, pl); }
 int b_wifi_get_rssi(void *u, int *r) { return self(u)->WifiGetRssi(r); }
 int b_wifi_get_ip(void *u, uint32_t *ip) { return self(u)->WifiGetIp(ip); }
 int b_wifi_get_current_ssid(void *u, char *ssid, int capacity) { return self(u)->WifiGetCurrentSsid(ssid, capacity); }
@@ -858,8 +857,7 @@ int b_inject(void *u, const char *a, const char *j) { return self(u)->Inject(a, 
 const net_backend_t g_sim_backend = {
     nullptr, nullptr,
     b_wifi_scan, b_wifi_sta_connect, b_wifi_sta_disconnect,
-    b_wifi_ap_start, b_wifi_ap_stop, b_wifi_ap_status, b_wifi_ap_configure_ipv4,
-    b_wifi_get_rssi, b_wifi_get_ip,
+    b_wifi_ap_start, b_wifi_ap_stop, b_wifi_get_rssi, b_wifi_get_ip,
     b_wifi_get_current_ssid, b_wifi_get_gateway,
     b_tcp_listen, b_tcp_accept, b_tcp_connect,
     b_sock_send, b_sock_recv, b_sock_close,
@@ -894,6 +892,66 @@ void sim_backend_destroy(void *user)
 const net_backend_t *sim_backend_table(void)
 {
     return &g_sim_backend;
+}
+
+int sim_backend_ap_list(const demo_params_t *params, sim_ap_record_t *out, int capacity)
+{
+    if (!params || !out || capacity <= 0)
+        return 0;
+    std::error_code error;
+    std::filesystem::path directory = ap_catalog_dir(*params);
+    if (!std::filesystem::exists(directory, error))
+        return 0;
+    int count = 0;
+    for (const auto &entry : std::filesystem::directory_iterator(directory, error)) {
+        if (error || count >= capacity)
+            break;
+        if (!entry.is_regular_file())
+            continue;
+        std::string name = entry.path().filename().string();
+        if (name.find(".tmp-") != std::string::npos)
+            continue; /* 跳过临时文件 */
+        unsigned index = 0;
+        if (sscanf(name.c_str(), "device-%u.json", &index) != 1)
+            continue; /* 非契约文件名忽略 */
+        std::string expected = "device-" + std::to_string(index) + ".json";
+        if (name != expected)
+            continue; /* 严格匹配正式文件名 */
+        if (index > 15)
+            continue;
+        if (!ap_record_read(entry.path(), &out[count])) {
+            LOG_W("SIM", "AP catalog 记录无效，已忽略：%s", name.c_str());
+            continue;
+        }
+        count++;
+    }
+    return count;
+}
+
+int sim_backend_ap_find(const demo_params_t *params, const char *ssid,
+                        sim_ap_record_t *out)
+{
+    if (!params || !ssid || !out)
+        return DEMO_ERR_INVAL;
+    SimAp local;
+    if (SimWorld::Instance().ApFind(ssid, &local)) {
+        memset(out, 0, sizeof(*out));
+        snprintf(out->ssid, sizeof(out->ssid), "%s", local.ssid);
+        snprintf(out->password, sizeof(out->password), "%s", local.password);
+        snprintf(out->pin, sizeof(out->pin), "%s", local.pin);
+        snprintf(out->device_id, sizeof(out->device_id), "%s", local.owner_tag);
+        out->real_port = local.real_port;
+        return DEMO_OK;
+    }
+    sim_ap_record_t records[16];
+    int count = sim_backend_ap_list(params, records, 16);
+    for (int i = 0; i < count; ++i) {
+        if (strcmp(records[i].ssid, ssid) == 0) {
+            *out = records[i];
+            return DEMO_OK;
+        }
+    }
+    return DEMO_ERR;
 }
 
 } // extern "C"

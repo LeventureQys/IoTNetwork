@@ -81,18 +81,13 @@ pc_set_output_dirs(pc_sim_backend)
 
 # windows：Native WiFi/IP/网关 + 组合 pc_socket_backend；绝不链接 pc_sim_backend
 if(WIN32)
-    add_library(pc_win_backend STATIC
-        backends/windows/win_backend.cpp
-        backends/windows/win_hotspot.cpp
-    )
+    add_library(pc_win_backend STATIC backends/windows/win_backend.cpp)
     target_include_directories(pc_win_backend PUBLIC
         "${CMAKE_CURRENT_SOURCE_DIR}/include/pc"
         "${CMAKE_CURRENT_SOURCE_DIR}/backends/windows"
         "${CMAKE_CURRENT_SOURCE_DIR}/backends/socket"
     )
-    target_link_libraries(pc_win_backend PUBLIC
-        pc_common pc_socket_backend wlanapi iphlpapi ws2_32 windowsapp runtimeobject
-    )
+    target_link_libraries(pc_win_backend PUBLIC pc_common pc_socket_backend wlanapi iphlpapi ws2_32)
     pc_enable_warnings(pc_win_backend)
     pc_set_output_dirs(pc_win_backend)
 endif()
@@ -101,6 +96,9 @@ endif()
 add_library(pc_core STATIC
     core/host_registry.cpp
     core/host_tcp_server.cpp
+    core/host_announcer.cpp
+    core/host_mdns.cpp
+    core/host_provision_client.cpp
     core/host_app.cpp
 )
 target_include_directories(pc_core PUBLIC

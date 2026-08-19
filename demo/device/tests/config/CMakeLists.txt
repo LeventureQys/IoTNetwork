@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+﻿cmake_minimum_required(VERSION 3.20)
 project(device_ss03_config_tests LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
@@ -43,10 +43,7 @@ include(GoogleTest)
 
 add_executable(device_config_tests
     test_device_config.cpp
-    test_contract.cpp
     test_host_options.cpp
 )
-target_compile_definitions(device_config_tests PRIVATE
-    DEVICE_CONTRACT_GOLDEN="${CMAKE_CURRENT_SOURCE_DIR}/../../../integration_tests/contracts/protocol-contract.golden.json")
 target_link_libraries(device_config_tests PRIVATE device_ss03_config_prod gtest_main)
 gtest_discover_tests(device_config_tests)

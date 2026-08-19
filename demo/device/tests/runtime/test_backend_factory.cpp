@@ -11,7 +11,8 @@ static device_sim_backend_options_t SimOpts()
     device_sim_backend_options_t o;
     memset(&o, 0, sizeof(o));
     o.nvs_file = "run/factory_test.nvs.json";
-    o.device_index = 0;
+    o.target_ssid = "TactileFactory-2.4G";
+    o.target_password = "securepass123";
     return o;
 }
 

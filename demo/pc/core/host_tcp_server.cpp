@@ -102,40 +102,12 @@ static int parse_frames(std::vector<uint8_t> &rx, cJSON **out)
     return 1;
 }
 
-int HostTcpServer::ActiveConnCount() const
-{
-    int count = (int)pending_.size();
-    for (DeviceEntry *e : reg_.AllOnline())
-        if (e->conn)
-            count++;
-    return count;
-}
-
-void HostTcpServer::RejectBusy(void *conn)
-{
-    cJSON *ack = cJSON_CreateObject();
-    cJSON_AddStringToObject(ack, "cmd", CMD_HOST_ACK);
-    cJSON_AddStringToObject(ack, "status", "busy");
-    cJSON_AddStringToObject(ack, "reason", "single_device_only");
-    SendFrame(conn, ack);
-    cJSON_Delete(ack);
-    LOG_W("HOST", "第二连接被拒绝：single_device_only");
-    net_sock_close(net_, conn);
-    pc_event_t ev;
-    memset(&ev, 0, sizeof(ev));
-    ev.event = "single_device_rejected";
-    ev.result = "ok";
-    ev.code = DEMO_OK;
-    ev.data_json = "{\"reason\":\"single_device_only\"}";
-    pc_events_emit(&ev);
-}
-
 void HostTcpServer::Poll(uint64_t now_ms)
 {
     if (!listen_)
         return;
 
-    /* accept 新连接（固定一对一：在线 + pending 总数 ≤ 1） */
+    /* accept 新连接 */
     while (true) {
         void *conn = nullptr;
         int rc = net_tcp_accept(net_, listen_, &conn, nullptr);
@@ -143,8 +115,16 @@ void HostTcpServer::Poll(uint64_t now_ms)
             break;
         if (rc != DEMO_OK)
             break;
-        if (ActiveConnCount() >= PROTO_HOST_MAX_CONN) {
-            RejectBusy(conn);
+        int limit = busy_override_ >= 0 ? busy_override_ : params_.host_max_conn;
+        if ((int)reg_.Size() + (int)pending_.size() >= limit) {
+            /* busy：回复 host_ack busy 后关闭 */
+            cJSON *ack = cJSON_CreateObject();
+            cJSON_AddStringToObject(ack, "cmd", CMD_HOST_ACK);
+            cJSON_AddStringToObject(ack, "status", "busy");
+            SendFrame(conn, ack);
+            cJSON_Delete(ack);
+            LOG_W("HOST", "连接被拒绝：服务繁忙（连接上限=%d）", limit);
+            net_sock_close(net_, conn);
         } else {
             PendingConn pc;
             pc.sock = conn;
@@ -174,7 +154,7 @@ void HostTcpServer::Poll(uint64_t now_ms)
         if (e->conn)
             HandleOnline(*e, now_ms);
         else
-            reg_.MarkOffline(e->id); /* 连接已断开（FIN/对端关闭）→ 立即离线 */
+            reg_.MarkOffline(e->id); /* 连接已断开（FIN/对端关闭）→ 立即离线，无需等心跳超时 */
     }
 
     /* 心跳判死 */
@@ -270,10 +250,10 @@ void HostTcpServer::HandlePending(PendingConn &pc, uint64_t now_ms)
             const cJSON *sid = cJSON_GetObjectItemCaseSensitive(json, "session_id");
             const cJSON *pv = cJSON_GetObjectItemCaseSensitive(json, "proto_ver");
             const cJSON *fw = cJSON_GetObjectItemCaseSensitive(json, "fw_version");
+            const cJSON *cap = cJSON_GetObjectItemCaseSensitive(json, "capabilities");
             const cJSON *upt = cJSON_GetObjectItemCaseSensitive(json, "uptime");
-            /* beta v1.1：必需字段 id/fw_version/proto_ver/uptime；session_id 可选 */
             if (!cJSON_IsString(id) || !cJSON_IsNumber(pv) || !cJSON_IsString(fw) ||
-                !cJSON_IsNumber(upt)) {
+                !cJSON_IsArray(cap) || !cJSON_IsNumber(upt)) {
                 pc.malformed++;
                 LOG_W("HOST", "device_hello 字段无效");
                 cJSON_Delete(json);
@@ -284,7 +264,7 @@ void HostTcpServer::HandlePending(PendingConn &pc, uint64_t now_ms)
                 cJSON *ack = cJSON_CreateObject();
                 cJSON_AddStringToObject(ack, "cmd", CMD_HOST_ACK);
                 cJSON_AddStringToObject(ack, "status", "fail");
-                cJSON_AddStringToObject(ack, "reason", "unsupported_protocol");
+                cJSON_AddStringToObject(ack, "reason", "协议版本过低");
                 SendFrame(pc.sock, ack);
                 cJSON_Delete(ack);
                 LOG_W("HOST", "设备 %s 的 proto_ver=%d 不受支持，已拒绝",
@@ -294,10 +274,15 @@ void HostTcpServer::HandlePending(PendingConn &pc, uint64_t now_ms)
                 cJSON_Delete(json);
                 break;
             }
-            /* 注册处理：离线同 ID 可恢复；在线同 ID 已在 accept 阶段按 busy 拒绝 */
+            /* 注册处理 */
             DeviceEntry *old = reg_.Find(id->valuestring);
             bool was_offline = old && old->state == "offline";
             bool resumed = false;
+            if (old && old->conn) {
+                LOG_W("HOST", "检测到重复连接，已关闭旧连接：%s", id->valuestring);
+                net_sock_close(net_, old->conn);
+                old->conn = nullptr;
+            }
             DeviceEntry *e = reg_.Add(id->valuestring, pc.sock);
             e->fw_version = fw->valuestring;
             e->proto_ver = pv->valueint;
@@ -306,8 +291,7 @@ void HostTcpServer::HandlePending(PendingConn &pc, uint64_t now_ms)
                 LOG_I("HOST", "注册：进入会话恢复路径，旧重连次数=%d，新重连次数=%d，session_id=%s",
                       old->reconnect_count, e->reconnect_count,
                       cJSON_IsString(sid) ? sid->valuestring : "（无）");
-                if (cJSON_IsString(sid) && !old->session_id.empty() &&
-                    strcmp(sid->valuestring, old->session_id.c_str()) == 0) {
+                if (cJSON_IsString(sid) && sid->valuestring == old->session_id && !old->session_id.empty()) {
                     LOG_I("HOST", "会话已恢复：%s", id->valuestring);
                     resumed = true;
                 }
@@ -324,11 +308,15 @@ void HostTcpServer::HandlePending(PendingConn &pc, uint64_t now_ms)
             cJSON_AddStringToObject(ack, "status", "ok");
             cJSON_AddNumberToObject(ack, "heartbeat_interval", params_.heartbeat_interval_ms / 1000);
             cJSON_AddStringToObject(ack, "session_id", e->session_id.c_str());
+            cJSON_AddNumberToObject(ack, "server_time", (int)time(nullptr));
             cJSON_AddNumberToObject(ack, "proto_ver", PROTO_VERSION);
+            cJSON_AddStringToObject(ack, "fw_min_req", "1.0.0");
             SendFrame(pc.sock, ack);
             cJSON_Delete(ack);
             LOG_I("HOST", "设备注册成功：%s，session_id=%s%s", id->valuestring,
                   e->session_id.c_str(), resumed ? "（已恢复）" : "");
+            /* host_ack ok 已发出：业务会话正式建立，与"WiFi 配置已接受"区分 */
+            LOG_I("HOST", "设备已完成配网并建立业务会话：%s", id->valuestring);
             e->conn = pc.sock; /* 从 pending 转入 registry */
             pc.sock = nullptr;
             {
@@ -347,11 +335,27 @@ void HostTcpServer::HandlePending(PendingConn &pc, uint64_t now_ms)
             cJSON_Delete(json);
             break;
         }
-        /* 未知命令（协议文档 10.2 前向兼容） */
+        /* 未知命令（协议文档 2.6 前向兼容） */
         if (name) {
-            LOG_D("HOST", "待注册连接收到未知命令 %s（已忽略）", name);
+            bool is_request = false; /* 简化：无 req_id 视为 notification */
+            const cJSON *req = cJSON_GetObjectItemCaseSensitive(json, "req_id");
+            if (cJSON_IsString(req)) {
+                cJSON *reply = cJSON_CreateObject();
+                cJSON_AddStringToObject(reply, "cmd", name);
+                cJSON_AddStringToObject(reply, "req_id", req->valuestring);
+                cJSON *data = cJSON_AddObjectToObject(reply, "data");
+                cJSON_AddStringToObject(data, "status", "unsupported");
+                SendFrame(pc.sock, reply);
+                cJSON_Delete(reply);
+                is_request = true;
+            }
+            LOG_D("HOST", "待注册连接收到未知命令 %s（%s）", name,
+                  is_request ? "已回复不支持" : "已忽略");
         }
         cJSON_Delete(json);
+    }
+    if (pc.sock == nullptr) {
+        /* 已转入 registry 或关闭：标记移除（调用方按 sock==nullptr 清理） */
     }
 }
 
@@ -385,10 +389,8 @@ void HostTcpServer::HandleOnline(DeviceEntry &e, uint64_t now_ms)
         int rc = parse_frames(rx, &json);
         if (rc == 0)
             break;
-        if (rc == DEMO_ERR) {
-            LOG_W("HOST", "在线连接收到畸形帧，已丢弃");
+        if (rc == DEMO_ERR)
             continue;
-        }
         const cJSON *cmd = cJSON_GetObjectItemCaseSensitive(json, "cmd");
         const char *name = cmd && cJSON_IsString(cmd) ? cmd->valuestring : nullptr;
         reg_.OnRx(e.id, now_ms);
@@ -411,7 +413,6 @@ void HostTcpServer::HandleOnline(DeviceEntry &e, uint64_t now_ms)
                 }
                 cJSON *pong = cJSON_CreateObject();
                 cJSON_AddStringToObject(pong, "cmd", CMD_PONG);
-                cJSON_AddNumberToObject(pong, "seq", seq->valueint); /* 回显序号 */
                 SendFrame(e.conn, pong);
                 cJSON_Delete(pong);
                 {
@@ -459,5 +460,10 @@ void HostTcpServer::BroadcastCloseAll()
         }
     }
     pending_.clear();
-    conn_rx_.clear();
+}
+
+void HostTcpServer::SetBusyOverride(int limit)
+{
+    busy_override_ = limit;
+    LOG_I("HOST", "繁忙连接上限已临时设为 %d", limit);
 }

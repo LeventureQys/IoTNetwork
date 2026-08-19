@@ -1,0 +1,43 @@
+{
+  "schema": 1,
+  "actions": [
+    {
+      "id": "c_prov",
+      "target": "pc",
+      "after_event": "ready",
+      "delay_ms": 2500,
+      "action": "auto_provision",
+      "args": {
+        "ssid": "TactileFactory-2.4G",
+        "password": "securepass123"
+      }
+    },
+    {
+      "id": "c_stop",
+      "target": "pc",
+      "after_event": "session_online",
+      "delay_ms": 3000,
+      "action": "request_stop",
+      "args": {}
+    },
+    {
+      "id": "c_dev_stop",
+      "target": "device",
+      "after_event": "session_offline",
+      "delay_ms": 1000,
+      "action": "request_stop",
+      "args": {}
+    },
+    {
+      "id": "c_prov_retry",
+      "target": "pc",
+      "after_event": "ready",
+      "delay_ms": 5000,
+      "action": "auto_provision",
+      "args": {
+        "ssid": "TactileFactory-2.4G",
+        "password": "securepass123"
+      }
+    }
+  ]
+}

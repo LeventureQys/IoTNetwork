@@ -9,6 +9,7 @@
 #include <netinet/in.h>
 #endif
 #include "sim_tcp_endpoint.h"
+#include "sim_world.h"
 #include "net_abstraction.h"
 
 namespace {
@@ -35,54 +36,61 @@ net_addr_t make_addr(const char *ip, int port)
 
 TEST(SimTcpEndpoint, RealDeviceKeepsRequestedEndpoint)
 {
-    net_addr_t requested = make_addr("192.168.137.1", 5935);
-    sim_tcp_endpoint_t ep = sim_tcp_resolve_endpoint(1, &requested, 1, 21000);
+    net_addr_t requested = make_addr("192.168.1.191", 5935);
+    sim_tcp_endpoint_t ep = sim_tcp_resolve_endpoint(
+        1, &requested, 0, 0, sim_world_host_virtual_ip(), 5935);
     EXPECT_EQ(ep.ip, requested.ip);
     EXPECT_EQ(ep.port, requested.port);
-    EXPECT_EQ(ip_str(ep.ip), "192.168.137.1");
+    EXPECT_EQ(ip_str(ep.ip), "192.168.1.191");
     EXPECT_EQ((unsigned)ntohs(ep.port), 5935u);
 }
 
-TEST(SimTcpEndpoint, SimPcMatchTranslatesToLoopbackPort)
+TEST(SimTcpEndpoint, RealDeviceIgnoresSimTranslation)
 {
-    net_addr_t requested = make_addr("192.168.137.1", 5935);
-    sim_tcp_endpoint_t ep = sim_tcp_resolve_endpoint(0, &requested, 1, 21000);
+    /* 真实模式即使传入模拟 AP/Host 匹配信息也必须保持请求端点 */
+    net_addr_t requested = make_addr("10.0.0.8", 9000);
+    sim_tcp_endpoint_t ep = sim_tcp_resolve_endpoint(
+        1, &requested, 1, 21000, inet_addr("192.168.1.50"), 5935);
+    EXPECT_EQ(ep.ip, requested.ip);
+    EXPECT_EQ(ep.port, requested.port);
+    EXPECT_EQ(ip_str(ep.ip), "10.0.0.8");
+    EXPECT_EQ((unsigned)ntohs(ep.port), 9000u);
+}
+
+TEST(SimTcpEndpoint, SimHostTranslationToLoopback)
+{
+    net_addr_t requested = make_addr("192.168.1.50", 5935);
+    sim_tcp_endpoint_t ep = sim_tcp_resolve_endpoint(
+        0, &requested, 0, 0, inet_addr("192.168.1.50"), 5935);
+    EXPECT_EQ(ep.ip, kLoopbackIpNetworkOrder);
+    EXPECT_EQ(ip_str(ep.ip), "127.0.0.1");
+    EXPECT_EQ((unsigned)ntohs(ep.port), 5935u);
+}
+
+TEST(SimTcpEndpoint, SimApTranslationToLoopbackRealPort)
+{
+    net_addr_t requested = make_addr("192.168.1.1", 5935);
+    sim_tcp_endpoint_t ep = sim_tcp_resolve_endpoint(
+        0, &requested, 1, 21000, inet_addr("192.168.1.50"), 5935);
     EXPECT_EQ(ep.ip, kLoopbackIpNetworkOrder);
     EXPECT_EQ(ip_str(ep.ip), "127.0.0.1");
     EXPECT_EQ((unsigned)ntohs(ep.port), 21000u);
 }
 
-TEST(SimTcpEndpoint, SimOtherAddressPassthrough)
+TEST(SimTcpEndpoint, SimOtherAddressKeepsRequestedPort)
 {
-    /* 未命中 PC 热点目标 → 不做翻译，保持请求端点 */
     net_addr_t requested = make_addr("10.1.2.3", 7000);
-    sim_tcp_endpoint_t ep = sim_tcp_resolve_endpoint(0, &requested, 0, 21000);
-    EXPECT_EQ(ep.ip, requested.ip);
+    sim_tcp_endpoint_t ep = sim_tcp_resolve_endpoint(
+        0, &requested, 0, 0, inet_addr("192.168.1.50"), 5935);
+    EXPECT_EQ(ep.ip, kLoopbackIpNetworkOrder);
+    EXPECT_EQ(ip_str(ep.ip), "127.0.0.1");
     EXPECT_EQ(ep.port, requested.port);
-    EXPECT_EQ(ip_str(ep.ip), "10.1.2.3");
     EXPECT_EQ((unsigned)ntohs(ep.port), 7000u);
-}
-
-TEST(SimTcpEndpoint, SimPcTargetWithoutMatchStaysRequested)
-{
-    /* 地址是 PC 目标但未判定命中（例如端口不同）→ 不做翻译 */
-    net_addr_t requested = make_addr("192.168.137.1", 7000);
-    sim_tcp_endpoint_t ep = sim_tcp_resolve_endpoint(0, &requested, 0, 21000);
-    EXPECT_EQ(ep.ip, requested.ip);
-    EXPECT_EQ(ep.port, requested.port);
-    EXPECT_EQ(ip_str(ep.ip), "192.168.137.1");
 }
 
 TEST(SimTcpEndpoint, NullRequestedReturnsZeroEndpoint)
 {
-    sim_tcp_endpoint_t ep = sim_tcp_resolve_endpoint(0, nullptr, 0, 0);
+    sim_tcp_endpoint_t ep = sim_tcp_resolve_endpoint(0, nullptr, 0, 0, 0, 0);
     EXPECT_EQ(ep.ip, 0u);
     EXPECT_EQ(ep.port, 0u);
-}
-
-TEST(SimTcpEndpoint, HostToNet16EndianSafe)
-{
-    uint16_t n = sim_tcp_host_to_net16(5935);
-    /* 网络字节序值 0x172F 与 ntohs 一致 */
-    EXPECT_EQ((unsigned)ntohs(n), 5935u);
 }

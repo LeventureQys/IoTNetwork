@@ -331,10 +331,8 @@ uint32_t b_random(void *user)
 
 const net_backend_t g_socket_backend = {
     nullptr, nullptr,                        /* init / deinit */
-    nullptr, nullptr, nullptr,               /* wifi scan/sta */
-    nullptr, nullptr,                        /* ap_start / ap_stop */
-    nullptr, nullptr,                        /* ap_status / ap_configure_ipv4 */
-    nullptr, nullptr, nullptr, nullptr,      /* rssi / get_ip / current_ssid / gateway */
+    nullptr, nullptr, nullptr,               /* wifi */
+    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
     b_tcp_listen, b_tcp_accept, b_tcp_connect,
     b_sock_send, b_sock_recv, b_sock_close,
     b_udp_mcast_join, b_udp_send, b_udp_recv,

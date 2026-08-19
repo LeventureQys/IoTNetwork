@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "actions": [
+    {
+      "id": "f_prov",
+      "target": "pc",
+      "after_event": "ready",
+      "delay_ms": 2500,
+      "action": "auto_provision",
+      "args": {
+        "ssid": "GhostNet-5G",
+        "password": "ghostpass123"
+      }
+    },
+    {
+      "id": "f_prov_retry",
+      "target": "pc",
+      "after_event": "ready",
+      "delay_ms": 5000,
+      "action": "auto_provision",
+      "args": {
+        "ssid": "GhostNet-5G",
+        "password": "ghostpass123"
+      }
+    },
+    {
+      "id": "f_stop",
+      "target": "pc",
+      "after_event": "ready",
+      "delay_ms": 15000,
+      "action": "request_stop",
+      "args": {}
+    }
+  ]
+}

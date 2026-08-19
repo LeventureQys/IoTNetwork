@@ -8,12 +8,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void ipv4_str(uint32_t ip, char *out, size_t cap)
-{
-    snprintf(out, cap, "%u.%u.%u.%u",
-             ip & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF, (ip >> 24) & 0xFF);
-}
-
 int session_connect(device_app_t *app, const net_addr_t *host)
 {
     void *sock = NULL;
@@ -27,12 +21,15 @@ int session_connect(device_app_t *app, const net_addr_t *host)
     app->malformed_count = 0;
     app->rx_len = 0; /* 新连接重置帧缓冲（跨连接残留会错乱解析） */
 
-    /* device_hello（beta v1.1：仅 id/fw_version/proto_ver/uptime + 可选 session_id） */
+    /* device_hello */
     cJSON *hello = cJSON_CreateObject();
     cJSON_AddStringToObject(hello, "cmd", CMD_DEVICE_HELLO);
     cJSON_AddStringToObject(hello, "id", app->device_id);
+    cJSON_AddStringToObject(hello, "type", "pressure_sensor");
     cJSON_AddStringToObject(hello, "fw_version", app->params->device_fw_version);
     cJSON_AddNumberToObject(hello, "proto_ver", app->params->device_proto_ver);
+    cJSON *caps = cJSON_AddArrayToObject(hello, "capabilities");
+    cJSON_AddItemToArray(caps, cJSON_CreateString("pressure"));
     cJSON_AddNumberToObject(hello, "uptime", device_app_uptime_s(app));
     if (app->session_id[0] != '\0')
         cJSON_AddStringToObject(hello, "session_id", app->session_id);
@@ -51,8 +48,10 @@ int session_connect(device_app_t *app, const net_addr_t *host)
 static void session_publish_online(device_app_t *app)
 {
     char data[128];
-    char peer[16];
-    ipv4_str(app->sess_host.ip, peer, sizeof(peer));
+    char peer[32];
+    snprintf(peer, sizeof(peer), "%u.%u.%u.%u", app->sess_host.ip & 0xFF,
+             (app->sess_host.ip >> 8) & 0xFF, (app->sess_host.ip >> 16) & 0xFF,
+             (app->sess_host.ip >> 24) & 0xFF);
     snprintf(data, sizeof(data), "{\"peer\":\"%s\",\"reconnect_count\":%u}",
              peer, app->session_connect_count);
     device_app_publish_event(app, "session_online", "ok", 0, data);
@@ -77,6 +76,38 @@ static void session_send_ping(device_app_t *app)
     cJSON_Delete(ping);
 }
 
+static void session_send_diag_report(device_app_t *app)
+{
+    if (app->sess_sock == NULL)
+        return;
+    int rssi = 0;
+    net_wifi_get_rssi(app->net, &rssi);
+    cJSON *rep = cJSON_CreateObject();
+    cJSON_AddStringToObject(rep, "cmd", CMD_DIAG_REPORT);
+    cJSON_AddNumberToObject(rep, "uptime", device_app_uptime_s(app));
+    cJSON_AddNumberToObject(rep, "rssi", rssi);
+    cJSON_AddStringToObject(rep, "state", device_state_str(app->state));
+    cJSON *ec = cJSON_AddObjectToObject(rep, "error_count");
+    cJSON_AddNumberToObject(ec, "wifi_disconnects", app->err_wifi_disconnects);
+    cJSON_AddNumberToObject(ec, "tcp_drops", app->err_tcp_drops);
+    cJSON_AddNumberToObject(ec, "auth_fails", app->err_auth_fails);
+    char events[1024];
+    evlog_fill_report(app, events, (int)sizeof(events));
+    cJSON *ev = cJSON_AddArrayToObject(rep, "events");
+    /* 简单拆分：events 为纯文本摘要数组，每行一条 */
+    char *line = strtok(events, "\n");
+    while (line && cJSON_GetArraySize(ev) < 10) {
+        cJSON_AddItemToArray(ev, cJSON_CreateString(line));
+        line = strtok(NULL, "\n");
+    }
+    cJSON_AddNumberToObject(rep, "last_event_time",
+                            app->evlog_count > 0
+                                ? (int)app->evlog[(app->evlog_head + app->evlog_count - 1) % 50].boot_s
+                                : 0);
+    device_send_frame(app, app->sess_sock, rep);
+    cJSON_Delete(rep);
+}
+
 int session_poll(device_app_t *app)
 {
     if (app->sess_sock == NULL) {
@@ -86,7 +117,7 @@ int session_poll(device_app_t *app)
     uint64_t now = net_time_ms(app->net);
 
     /* 收包 */
-    device_app_handle_rx(app, app->sess_sock);
+    device_app_handle_rx(app, app->sess_sock, 1);
 
     /* 心跳 */
     if (app->last_ping_ms == 0 || now - app->last_ping_ms >= (uint64_t)app->heartbeat_interval_ms) {
@@ -121,6 +152,7 @@ void session_on_msg(device_app_t *app, cJSON *msg)
             app->session_ack_ok = 1;
             const cJSON *sid = cJSON_GetObjectItemCaseSensitive(msg, "session_id");
             const cJSON *hb = cJSON_GetObjectItemCaseSensitive(msg, "heartbeat_interval");
+            const cJSON *st = cJSON_GetObjectItemCaseSensitive(msg, "server_time");
             const cJSON *pv = cJSON_GetObjectItemCaseSensitive(msg, "proto_ver");
             if (cJSON_IsString(sid))
                 snprintf(app->session_id, sizeof(app->session_id), "%s", sid->valuestring);
@@ -130,6 +162,8 @@ void session_on_msg(device_app_t *app, cJSON *msg)
                     ? app->params->heartbeat_dead_ms
                     : app->heartbeat_interval_ms * 3 / 2;
             }
+            if (cJSON_IsNumber(st))
+                app->server_time_sync_ms = net_time_ms(app->net) - (uint64_t)st->valueint * 1000;
             LOG_I(app->device_id, "会话：host_ack 成功，session_id=%s，心跳=%d毫秒，proto_ver=%d",
                   app->session_id, app->heartbeat_interval_ms,
                   cJSON_IsNumber(pv) ? pv->valueint : -1);
@@ -152,14 +186,16 @@ void session_on_msg(device_app_t *app, cJSON *msg)
 
     if (strcmp(name, CMD_PONG) == 0) {
         const cJSON *seq = cJSON_GetObjectItemCaseSensitive(msg, "seq");
-        int s = cJSON_IsNumber(seq) ? (int)seq->valueint : 0;
-        if (s != 0 && s != (int)app->ping_seq)
-            LOG_W(app->device_id, "会话：pong 序号不匹配（期望=%u，实际=%d）",
-                  app->ping_seq, s);
         char data[64];
-        snprintf(data, sizeof(data), "{\"direction\":\"rx\",\"sequence\":%d}", s);
+        snprintf(data, sizeof(data), "{\"direction\":\"rx\",\"sequence\":%d}",
+                 cJSON_IsNumber(seq) ? (int)seq->valueint : 0);
         device_app_publish_event(app, "pong", "ok", 0, data);
         LOG_T(app->device_id, "会话：收到 pong");
+        return;
+    }
+
+    if (strcmp(name, CMD_DIAG_QUERY) == 0) {
+        session_send_diag_report(app);
         return;
     }
 
@@ -179,7 +215,7 @@ void session_on_msg(device_app_t *app, cJSON *msg)
         return;
     }
 
-    /* 对端发起方向消息（hello/ping 等）属协议错误，由 handle_rx 计数畸形 */
+    /* 对端发起方向消息（hello/ping/diag_report）属协议错误，由 handle_rx 计数畸形 */
     LOG_D(app->device_id, "会话：收到非预期命令 %s", name);
 }
 

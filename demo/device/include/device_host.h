@@ -68,12 +68,13 @@ typedef struct device_snapshot {
     int device_state;
     int rssi_dbm;
     uint32_t uptime_seconds;
+    int provision_port;
     int backend_kind;
     int session_online;
     char device_id[18];
-    char target_ssid[33];     /* 配置的目标 PC 热点 SSID */
-    char pc_host_ip[16];      /* 配置的固定上位机 IPv4 */
-    int pc_host_port;         /* 固定 TCP 端口（5935） */
+    char ap_ssid[33];
+    char ap_password[64];
+    char provision_pin[8];
     char backend_name[32];
     char last_error[256];
 } device_snapshot_t;

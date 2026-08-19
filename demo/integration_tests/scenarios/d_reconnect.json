@@ -2,6 +2,17 @@
   "schema": 1,
   "actions": [
     {
+      "id": "d_prov",
+      "target": "pc",
+      "after_event": "ready",
+      "delay_ms": 2500,
+      "action": "auto_provision",
+      "args": {
+        "ssid": "TactileFactory-2.4G",
+        "password": "securepass123"
+      }
+    },
+    {
       "id": "d_fault",
       "target": "device",
       "after_event": "session_online",
@@ -21,6 +32,17 @@
       "args": {
         "name": "sock_send_fail",
         "argument_json": "{\"skip\":0,\"count\":0}"
+      }
+    },
+    {
+      "id": "d_prov_retry",
+      "target": "pc",
+      "after_event": "ready",
+      "delay_ms": 5000,
+      "action": "auto_provision",
+      "args": {
+        "ssid": "TactileFactory-2.4G",
+        "password": "securepass123"
       }
     }
   ]

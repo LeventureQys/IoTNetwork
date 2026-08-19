@@ -17,15 +17,8 @@
 #include "protocol.h"
 #include "common.h"
 #include "sim_world.h"
-#include "sim_ap_catalog.h"
 
 namespace {
-
-/* mDNS/组播为 v1.1 之前的服务发现通道，vtable 仍保留；协议常量已裁剪，
- * 此处使用与旧值一致的本地字面量。 */
-static const char *kMdnsType = "_tactile._tcp";
-static const char *kMcastGroup = "224.0.2.1";
-static const uint16_t kMcastPort = 5936;
 
 std::string MakeTempDir(const char *prefix)
 {
@@ -37,28 +30,9 @@ std::string MakeTempDir(const char *prefix)
     return dir.string();
 }
 
-std::string HotspotPath(const std::string &catalog)
+std::string CatalogPath(const std::string &root, unsigned idx)
 {
-    return catalog + "/pc-hotspot.json";
-}
-
-/* 直接写一个 schema2 记录文件，模拟 PC 侧发布（设备侧只读取） */
-void WriteHotspot(const std::string &catalog, const char *ssid, const char *password,
-                  unsigned loopback_port, uint64_t published_ms, unsigned long pid)
-{
-    std::filesystem::create_directories(catalog);
-    char buf[1024];
-    snprintf(buf, sizeof(buf),
-             "{\"schema\":2,\"ssid\":\"%s\",\"password\":\"%s\","
-             "\"logical_gateway\":\"192.168.137.1\",\"prefix_length\":24,"
-             "\"tcp_port\":5935,\"loopback_host\":\"127.0.0.1\","
-             "\"loopback_port\":%u,\"published_at_ms\":%llu,\"owner_pid\":%lu}",
-             ssid, password, loopback_port,
-             (unsigned long long)published_ms, pid);
-    FILE *fp = fopen(HotspotPath(catalog).c_str(), "wb");
-    ASSERT_NE(fp, nullptr);
-    fputs(buf, fp);
-    fclose(fp);
+    return root + "/catalog/device-" + std::to_string(idx) + ".json";
 }
 
 struct Opts {
@@ -66,7 +40,7 @@ struct Opts {
     std::string catalog;
     std::string nvs;
 
-    explicit Opts(const std::string &root, unsigned idx, uint32_t seed = 42)
+    Opts(const std::string &root, unsigned idx, unsigned port, uint32_t seed = 42)
     {
         memset(&o, 0, sizeof(o));
         catalog = root + "/catalog";
@@ -74,7 +48,11 @@ struct Opts {
         o.config_path = "unused";
         o.sim_catalog_dir = catalog.c_str();
         o.nvs_file = nvs.c_str();
+        o.target_ssid = "TactileFactory-2.4G";
+        o.target_password = "modutech_leventure";
+        o.host_virtual_ip = "192.168.1.50";
         o.device_index = idx;
+        o.provision_port = port;
         o.random_seed = seed;
     }
 };
@@ -96,18 +74,12 @@ void Destroy(device_backend_instance_t *inst)
     memset(inst, 0, sizeof(*inst));
 }
 
-uint64_t NowMs()
-{
-    /* 与 catalog 墙钟一致（发布者/读者跨进程同一时钟基准） */
-    return (uint64_t)sim_ap_catalog_wallclock_ms();
-}
-
 } // namespace
 
 TEST(SimBackendFactory, SuccessFillsInstance)
 {
     std::string root = MakeTempDir("simbackend");
-    Opts opts(root, 0);
+    Opts opts(root, 0, 21000);
     device_backend_instance_t inst;
     device_error_t err;
     memset(&inst, 0xFF, sizeof(inst));
@@ -139,7 +111,7 @@ TEST(SimBackendFactory, CreateFailureRollsBack)
     EXPECT_EQ(inst.destroy_user, nullptr);
 
     /* catalog_dir 为空 */
-    Opts o(root, 0);
+    Opts o(root, 0, 21000);
     o.o.sim_catalog_dir = "";
     memset(&inst, 0xFF, sizeof(inst));
     EXPECT_EQ(device_sim_backend_create(&o.o, &inst, &err), DEVICE_ERR_INVALID_ARGUMENT);
@@ -148,20 +120,26 @@ TEST(SimBackendFactory, CreateFailureRollsBack)
     EXPECT_NE(err.message[0], 0);
 
     /* catalog_dir 非绝对路径 */
-    Opts o2(root, 0);
+    Opts o2(root, 0, 21000);
     o2.o.sim_catalog_dir = "relative/catalog";
     memset(&inst, 0xFF, sizeof(inst));
     EXPECT_EQ(device_sim_backend_create(&o2.o, &inst, &err), DEVICE_ERR_INVALID_ARGUMENT);
     EXPECT_EQ(inst.user, nullptr);
 
     /* device_index 越界 */
-    Opts o3(root, 16);
+    Opts o3(root, 16, 21000);
     memset(&inst, 0xFF, sizeof(inst));
     EXPECT_EQ(device_sim_backend_create(&o3.o, &inst, &err), DEVICE_ERR_INVALID_ARGUMENT);
     EXPECT_EQ(inst.user, nullptr);
 
+    /* provision_port 越界 */
+    Opts o4(root, 0, 70000);
+    memset(&inst, 0xFF, sizeof(inst));
+    EXPECT_EQ(device_sim_backend_create(&o4.o, &inst, &err), DEVICE_ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(inst.user, nullptr);
+
     /* out_instance 为空 */
-    EXPECT_EQ(device_sim_backend_create(&o3.o, nullptr, &err), DEVICE_ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(device_sim_backend_create(&o4.o, nullptr, &err), DEVICE_ERR_INVALID_ARGUMENT);
 }
 
 TEST(SimBackendFactory, OptionsStringsAreCopied)
@@ -172,21 +150,30 @@ TEST(SimBackendFactory, OptionsStringsAreCopied)
     char borrowed[512];
     snprintf(borrowed, sizeof(borrowed), "%s", original.c_str());
 
-    Opts opts(root, 0);
+    Opts opts(root, 0, 21000);
     opts.o.sim_catalog_dir = borrowed;
     device_backend_instance_t inst = Create(opts);
     /* 调用期借用结束后修改源字符串，实例行为不受影响 */
     snprintf(borrowed, sizeof(borrowed), "%s", mutated.c_str());
 
-    /* 向"原值"目录写热点，实例应仍读取原值目录（而非被改写的源串） */
-    WriteHotspot(original, "Modu_PC", "modu_leventure", 21000, NowMs(),
-                 (unsigned long)sim_ap_catalog_current_pid());
-    net_ap_info_t aps[8];
-    int count = 8;
-    EXPECT_EQ(inst.vtable->wifi_scan(inst.user, aps, &count), DEMO_OK);
-    EXPECT_EQ(count, 1);
-    EXPECT_STREQ(aps[0].ssid, "Modu_PC");
+    ASSERT_EQ(inst.vtable->wifi_ap_start(inst.user, "Modu_0001", "pass123456", "1234"), DEMO_OK);
+    EXPECT_TRUE(std::filesystem::exists(original + "/device-0.json"));
+    EXPECT_FALSE(std::filesystem::exists(mutated + "/device-0.json"));
     Destroy(&inst);
+}
+
+TEST(SimBackendFactory, DestroyIdempotentAndRemovesCatalog)
+{
+    std::string root = MakeTempDir("simbackend");
+    Opts opts(root, 0, 21000);
+    device_backend_instance_t inst = Create(opts);
+    ASSERT_EQ(inst.vtable->wifi_ap_start(inst.user, "Modu_0001", "pass123456", "1234"), DEMO_OK);
+    EXPECT_TRUE(std::filesystem::exists(CatalogPath(root, 0)));
+    /* 销毁清理：world 注销 + catalog 正式文件与本进程 tmp 删除 */
+    Destroy(&inst);
+    EXPECT_FALSE(std::filesystem::exists(CatalogPath(root, 0)));
+    /* destroy_user 可接收 NULL（struct 级幂等由 SS03 的 instance_destroy 保证） */
+    inst.destroy_user = nullptr;
 }
 
 TEST(SimBackendFactory, DestroyAllZeroInstanceSafe)
@@ -197,260 +184,18 @@ TEST(SimBackendFactory, DestroyAllZeroInstanceSafe)
     EXPECT_EQ(inst.destroy_user, nullptr);
 }
 
-TEST(SimBackend, WifiScanReturnsPcHotspotWhenPublished)
-{
-    std::string root = MakeTempDir("simbackend");
-    Opts opts(root, 0);
-    device_backend_instance_t inst = Create(opts);
-
-    /* 无记录 → 不返回任何 AP */
-    net_ap_info_t aps[8];
-    int count = 8;
-    EXPECT_EQ(inst.vtable->wifi_scan(inst.user, aps, &count), DEMO_OK);
-    EXPECT_EQ(count, 0);
-
-    /* 记录存在 → 作为一条 2.4GHz AP 返回 */
-    WriteHotspot(opts.catalog, "Modu_PC", "modu_leventure", 21000, NowMs(),
-                 (unsigned long)sim_ap_catalog_current_pid());
-    count = 8;
-    EXPECT_EQ(inst.vtable->wifi_scan(inst.user, aps, &count), DEMO_OK);
-    EXPECT_EQ(count, 1);
-    EXPECT_STREQ(aps[0].ssid, "Modu_PC");
-    EXPECT_EQ(aps[0].band_2g, 1);
-
-    /* 容量 0 时 count 仍统计实际命中数 */
-    count = 0;
-    EXPECT_EQ(inst.vtable->wifi_scan(inst.user, nullptr, &count), DEMO_OK);
-    EXPECT_EQ(count, 1);
-    Destroy(&inst);
-}
-
-TEST(SimBackend, StaConnectExactSsidAndPassword)
-{
-    std::string root = MakeTempDir("simbackend");
-    Opts opts(root, 0);
-    device_backend_instance_t inst = Create(opts);
-    WriteHotspot(opts.catalog, "Modu_PC", "modu_leventure", 21000, NowMs(),
-                 (unsigned long)sim_ap_catalog_current_pid());
-
-    wifi_reason_t reason = WIFI_REASON_OK;
-
-    /* 精确 SSID + 密码成功 */
-    EXPECT_EQ(inst.vtable->wifi_sta_connect(inst.user, "Modu_PC", "modu_leventure", &reason),
-              DEMO_OK);
-    EXPECT_EQ((int)reason, 0);
-
-    char cur[33];
-    EXPECT_EQ(inst.vtable->wifi_get_current_ssid(inst.user, cur, sizeof(cur)), DEMO_OK);
-    EXPECT_STREQ(cur, "Modu_PC");
-
-    /* 网关返回 192.168.137.1 */
-    uint32_t gw = 0;
-    EXPECT_EQ(inst.vtable->wifi_get_gateway(inst.user, &gw), DEMO_OK);
-    EXPECT_EQ(gw, inet_addr(PROTO_PC_AP_IP));
-
-    /* SSID 不符 → NO_AP_FOUND(201) */
-    EXPECT_EQ(inst.vtable->wifi_sta_connect(inst.user, "OtherSSID", "modu_leventure", &reason),
-              DEMO_ERR);
-    EXPECT_EQ((int)reason, 201);
-
-    /* 密码不符 → AUTH_FAIL(202) */
-    EXPECT_EQ(inst.vtable->wifi_sta_connect(inst.user, "Modu_PC", "wrongpass", &reason),
-              DEMO_ERR);
-    EXPECT_EQ((int)reason, 202);
-    Destroy(&inst);
-}
-
-TEST(SimBackend, StaConnectNoRecordReturnsNoApFound)
-{
-    std::string root = MakeTempDir("simbackend");
-    Opts opts(root, 0);
-    device_backend_instance_t inst = Create(opts);
-
-    wifi_reason_t reason = WIFI_REASON_OK;
-    EXPECT_EQ(inst.vtable->wifi_sta_connect(inst.user, "Modu_PC", "modu_leventure", &reason),
-              DEMO_ERR);
-    EXPECT_EQ((int)reason, 201);
-    Destroy(&inst);
-}
-
-TEST(SimBackend, InvalidOrExpiredRecordIgnored)
-{
-    /* 损坏 JSON → 忽略（scan 无结果 / connect NO_AP_FOUND） */
-    {
-        std::string root = MakeTempDir("simbackend");
-        Opts opts(root, 0);
-        device_backend_instance_t inst = Create(opts);
-        std::filesystem::create_directories(opts.catalog);
-        FILE *fp = fopen(HotspotPath(opts.catalog).c_str(), "wb");
-        ASSERT_NE(fp, nullptr);
-        fputs("### not json ###", fp);
-        fclose(fp);
-
-        net_ap_info_t aps[8];
-        int count = 8;
-        EXPECT_EQ(inst.vtable->wifi_scan(inst.user, aps, &count), DEMO_OK);
-        EXPECT_EQ(count, 0);
-        wifi_reason_t reason = WIFI_REASON_OK;
-        EXPECT_EQ(inst.vtable->wifi_sta_connect(inst.user, "Modu_PC", "modu_leventure", &reason),
-                  DEMO_ERR);
-        EXPECT_EQ((int)reason, 201);
-        Destroy(&inst);
-    }
-
-    /* schema 非 2 → 忽略 */
-    {
-        std::string root = MakeTempDir("simbackend");
-        Opts opts(root, 0);
-        device_backend_instance_t inst = Create(opts);
-        std::filesystem::create_directories(opts.catalog);
-        FILE *fp = fopen(HotspotPath(opts.catalog).c_str(), "wb");
-        ASSERT_NE(fp, nullptr);
-        fputs("{\"schema\":1,\"ssid\":\"Modu_PC\",\"password\":\"modu_leventure\","
-              "\"logical_gateway\":\"192.168.137.1\",\"prefix_length\":24,"
-              "\"tcp_port\":5935,\"loopback_host\":\"127.0.0.1\","
-              "\"loopback_port\":21000,\"published_at_ms\":1,\"owner_pid\":1}", fp);
-        fclose(fp);
-        net_ap_info_t aps[8];
-        int count = 8;
-        EXPECT_EQ(inst.vtable->wifi_scan(inst.user, aps, &count), DEMO_OK);
-        EXPECT_EQ(count, 0);
-        Destroy(&inst);
-    }
-
-    /* 过期且 owner 死亡 → 忽略 */
-    {
-        std::string root = MakeTempDir("simbackend");
-        Opts opts(root, 0);
-        device_backend_instance_t inst = Create(opts);
-        WriteHotspot(opts.catalog, "Modu_PC", "modu_leventure", 21000,
-                     NowMs() - 40000, 999999999 /* 必然不存在的 PID */);
-        net_ap_info_t aps[8];
-        int count = 8;
-        EXPECT_EQ(inst.vtable->wifi_scan(inst.user, aps, &count), DEMO_OK);
-        EXPECT_EQ(count, 0);
-        Destroy(&inst);
-    }
-}
-
-TEST(SimBackend, TcpConnectTranslatesPcApToLoopback)
-{
-    std::string root = MakeTempDir("simbackend");
-    Opts a_opts(root, 0);
-    Opts b_opts(root, 1);
-    device_backend_instance_t a = Create(a_opts);
-    device_backend_instance_t b = Create(b_opts);
-
-    /* PC 发布：loopback_port=21000（a 在此端口监听） */
-    WriteHotspot(a_opts.catalog, "Modu_PC", "modu_leventure", 21000, NowMs(),
-                 (unsigned long)sim_ap_catalog_current_pid());
-
-    void *listen = nullptr;
-    ASSERT_EQ(a.vtable->tcp_listen(a.user, 21000, &listen), DEMO_OK);
-
-    /* b 连接 192.168.137.1:5935 → 翻译到 127.0.0.1:21000 */
-    net_addr_t vaddr;
-    vaddr.ip = inet_addr(PROTO_PC_AP_IP);
-    vaddr.port = htons(PROTO_TCP_PORT);
-    void *conn = nullptr;
-    ASSERT_EQ(b.vtable->tcp_connect(b.user, &vaddr, &conn, 2000), DEMO_OK);
-
-    void *accepted = nullptr;
-    int rc = DEMO_ERR_AGAIN;
-    for (int i = 0; i < 100 && rc == DEMO_ERR_AGAIN; i++) {
-        rc = a.vtable->tcp_accept(a.user, listen, &accepted, nullptr);
-        if (rc == DEMO_ERR_AGAIN)
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    ASSERT_EQ(rc, DEMO_OK);
-
-    b.vtable->sock_close(b.user, conn);
-    a.vtable->sock_close(a.user, accepted);
-    a.vtable->sock_close(a.user, listen);
-    Destroy(&a);
-    Destroy(&b);
-}
-
-TEST(SimBackend, TcpConnectOtherAddressNotTranslated)
-{
-    std::string root = MakeTempDir("simbackend");
-    Opts a_opts(root, 0);
-    Opts b_opts(root, 1);
-    device_backend_instance_t a = Create(a_opts);
-    device_backend_instance_t b = Create(b_opts);
-
-    /* 无 catalog 记录：连接非 PC 目标（loopback 直连）不做翻译，仍可直连 */
-    void *listen = nullptr;
-    ASSERT_EQ(a.vtable->tcp_listen(a.user, 21100, &listen), DEMO_OK);
-    net_addr_t addr;
-    addr.ip = htonl(INADDR_LOOPBACK);
-    addr.port = htons(21100);
-    void *conn = nullptr;
-    ASSERT_EQ(b.vtable->tcp_connect(b.user, &addr, &conn, 2000), DEMO_OK);
-
-    void *accepted = nullptr;
-    int rc = DEMO_ERR_AGAIN;
-    for (int i = 0; i < 100 && rc == DEMO_ERR_AGAIN; i++) {
-        rc = a.vtable->tcp_accept(a.user, listen, &accepted, nullptr);
-        if (rc == DEMO_ERR_AGAIN)
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    ASSERT_EQ(rc, DEMO_OK);
-    b.vtable->sock_close(b.user, conn);
-    a.vtable->sock_close(a.user, accepted);
-    a.vtable->sock_close(a.user, listen);
-
-    /* 无 catalog 记录时，连接 PC 固定目标应 fail-closed（无法翻译） */
-    net_addr_t pcaddr;
-    pcaddr.ip = inet_addr(PROTO_PC_AP_IP);
-    pcaddr.port = htons(PROTO_TCP_PORT);
-    void *conn2 = nullptr;
-    EXPECT_EQ(b.vtable->tcp_connect(b.user, &pcaddr, &conn2, 500), DEMO_ERR);
-
-    Destroy(&a);
-    Destroy(&b);
-}
-
-TEST(SimBackend, PcStopRemovesHotspotFromScan)
-{
-    std::string root = MakeTempDir("simbackend");
-    Opts opts(root, 0);
-    device_backend_instance_t inst = Create(opts);
-    WriteHotspot(opts.catalog, "Modu_PC", "modu_leventure", 21000, NowMs(),
-                 (unsigned long)sim_ap_catalog_current_pid());
-
-    net_ap_info_t aps[8];
-    int count = 8;
-    EXPECT_EQ(inst.vtable->wifi_scan(inst.user, aps, &count), DEMO_OK);
-    EXPECT_EQ(count, 1);
-
-    /* PC 停止：删除记录文件 → 设备不再扫描到热点 */
-    std::filesystem::remove(HotspotPath(opts.catalog));
-    count = 8;
-    EXPECT_EQ(inst.vtable->wifi_scan(inst.user, aps, &count), DEMO_OK);
-    EXPECT_EQ(count, 0);
-    Destroy(&inst);
-}
-
-TEST(SimBackend, ApStartStopReturnErr)
-{
-    std::string root = MakeTempDir("simbackend");
-    Opts opts(root, 0);
-    device_backend_instance_t inst = Create(opts);
-    /* v1.1 设备不再创建热点 */
-    EXPECT_EQ(inst.vtable->wifi_ap_start(inst.user, "Modu_PC", "modu_leventure", "1234"),
-              DEMO_ERR);
-    EXPECT_EQ(inst.vtable->wifi_ap_stop(inst.user), DEMO_ERR);
-    Destroy(&inst);
-}
-
 TEST(SimBackend, TwoInstancesIsolated)
 {
     std::string root = MakeTempDir("simbackend");
-    device_backend_instance_t a = Create(Opts(root, 0, 7));
-    device_backend_instance_t b = Create(Opts(root, 1, 9));
+    device_backend_instance_t a = Create(Opts(root, 0, 21000, 7));
+    device_backend_instance_t b = Create(Opts(root, 1, 21001, 9));
 
-    /* RSSI 隔离（A 注入不影响 B） */
+    /* A 开 AP 只影响 A */
+    ASSERT_EQ(a.vtable->wifi_ap_start(a.user, "Modu_A", "pass123456", "1234"), DEMO_OK);
+    EXPECT_TRUE(std::filesystem::exists(CatalogPath(root, 0)));
+    EXPECT_FALSE(std::filesystem::exists(CatalogPath(root, 1)));
+
+    /* B 的 RSSI 不受 A 注入影响 */
     ASSERT_EQ(a.vtable->inject(a.user, "rssi_set", "-80"), DEMO_OK);
     int rssi = 0;
     EXPECT_EQ(a.vtable->wifi_get_rssi(a.user, &rssi), DEMO_OK);
@@ -458,27 +203,34 @@ TEST(SimBackend, TwoInstancesIsolated)
     EXPECT_EQ(b.vtable->wifi_get_rssi(b.user, &rssi), DEMO_OK);
     EXPECT_EQ(rssi, -58);
 
-    /* 未连接时 IP 为 0 */
+    /* B 的 AP 状态不受 A 影响 */
     uint32_t ip = 0xFFFFFFFF;
-    EXPECT_EQ(a.vtable->wifi_get_ip(a.user, &ip), DEMO_OK);
+    EXPECT_EQ(b.vtable->wifi_get_ip(b.user, &ip), DEMO_OK);
     EXPECT_EQ(ip, 0u);
+    EXPECT_EQ(a.vtable->wifi_get_ip(a.user, &ip), DEMO_OK);
+    EXPECT_EQ(ip, sim_world_device_ap_virtual_ip());
+
+    /* B 销毁不影响 A 的 catalog 文件 */
+    Destroy(&b);
+    EXPECT_TRUE(std::filesystem::exists(CatalogPath(root, 0)));
 
     /* NVS 文件隔离 */
     EXPECT_FALSE(std::filesystem::exists(root + "/dev1.nvs.json"));
     EXPECT_FALSE(std::filesystem::exists(root + "/dev0.nvs.json"));
     ASSERT_EQ(a.vtable->nvs_set(a.user, "k", (const uint8_t *)"v", 1), DEMO_OK);
     EXPECT_TRUE(std::filesystem::exists(root + "/dev0.nvs.json"));
-    EXPECT_FALSE(std::filesystem::exists(root + "/dev1.nvs.json"));
 
+    /* A 停止 AP 清理自己 */
+    ASSERT_EQ(a.vtable->wifi_ap_stop(a.user), DEMO_OK);
+    EXPECT_FALSE(std::filesystem::exists(CatalogPath(root, 0)));
     Destroy(&a);
-    Destroy(&b);
 }
 
 TEST(SimBackend, FaultInjectionConsumptionIsolation)
 {
     std::string root = MakeTempDir("simbackend");
-    device_backend_instance_t a = Create(Opts(root, 0));
-    device_backend_instance_t b = Create(Opts(root, 1));
+    device_backend_instance_t a = Create(Opts(root, 0, 21000));
+    device_backend_instance_t b = Create(Opts(root, 1, 21001));
 
     void *listen = nullptr;
     ASSERT_EQ(a.vtable->tcp_listen(a.user, 21200, &listen), DEMO_OK);
@@ -496,9 +248,11 @@ TEST(SimBackend, FaultInjectionConsumptionIsolation)
     }
     ASSERT_EQ(rc, DEMO_OK);
 
+    /* A 注入 sock_send_fail：1 次失败后恢复；B 的发送路径独立 */
     ASSERT_EQ(a.vtable->inject(a.user, "sock_send_fail", "{\"count\":1}"), DEMO_OK);
     const char *msg = "hello";
-    EXPECT_EQ(a.vtable->sock_send(a.user, conn, (const uint8_t *)msg, 5), DEMO_ERR);
+    EXPECT_EQ(a.vtable->sock_send(a.user, conn, (const uint8_t *)msg, 5), DEMO_ERR); /* 注入失败，未发送 */
+    /* B 正常发送，A 正常接收（B 不受 A 注入影响） */
     EXPECT_EQ(b.vtable->sock_send(b.user, accepted, (const uint8_t *)msg, 5), 5);
     uint8_t buf[16];
     int n = 0;
@@ -510,6 +264,7 @@ TEST(SimBackend, FaultInjectionConsumptionIsolation)
     }
     EXPECT_EQ(n, 5);
     EXPECT_EQ(memcmp(buf, msg, 5), 0);
+    /* A 再次发送恢复（注入计数已消耗），B 正常收到 */
     EXPECT_EQ(a.vtable->sock_send(a.user, conn, (const uint8_t *)msg, 5), 5);
     n = 0;
     for (int i = 0; i < 100; i++) {
@@ -530,8 +285,31 @@ TEST(SimBackend, FaultInjectionConsumptionIsolation)
 TEST(SimBackend, InjectActions)
 {
     std::string root = MakeTempDir("simbackend");
-    Opts opts(root, 0);
-    device_backend_instance_t inst = Create(opts);
+    device_backend_instance_t inst = Create(Opts(root, 0, 21000));
+    wifi_reason_t reason = WIFI_REASON_OK;
+
+    /* wifi_disconnect / wifi_ok */
+    ASSERT_EQ(inst.vtable->inject(inst.user, "wifi_disconnect", nullptr), DEMO_OK);
+    EXPECT_EQ(inst.vtable->wifi_sta_connect(inst.user, "TactileFactory-2.4G",
+                                            "modutech_leventure", &reason),
+              DEMO_ERR);
+    EXPECT_EQ((int)reason, 201);
+    ASSERT_EQ(inst.vtable->inject(inst.user, "wifi_ok", nullptr), DEMO_OK);
+    EXPECT_EQ(inst.vtable->wifi_sta_connect(inst.user, "TactileFactory-2.4G",
+                                            "modutech_leventure", &reason),
+              DEMO_OK);
+    EXPECT_EQ((int)reason, 0);
+
+    /* wifi_auth_fail / wifi_auth_ok */
+    ASSERT_EQ(inst.vtable->inject(inst.user, "wifi_auth_fail", nullptr), DEMO_OK);
+    EXPECT_EQ(inst.vtable->wifi_sta_connect(inst.user, "TactileFactory-2.4G",
+                                            "modutech_leventure", &reason),
+              DEMO_ERR);
+    EXPECT_EQ((int)reason, 202);
+    ASSERT_EQ(inst.vtable->inject(inst.user, "wifi_auth_ok", nullptr), DEMO_OK);
+    EXPECT_EQ(inst.vtable->wifi_sta_connect(inst.user, "TactileFactory-2.4G",
+                                            "modutech_leventure", &reason),
+              DEMO_OK);
 
     /* rssi_set：裸数字与 JSON 两种形式 */
     ASSERT_EQ(inst.vtable->inject(inst.user, "rssi_set", "-80"), DEMO_OK);
@@ -542,20 +320,21 @@ TEST(SimBackend, InjectActions)
     EXPECT_EQ(inst.vtable->wifi_get_rssi(inst.user, &rssi), DEMO_OK);
     EXPECT_EQ(rssi, -75);
 
-    /* 连接成功后 wifi_ssid_mismatch 覆盖当前 SSID */
-    WriteHotspot(opts.catalog, "Modu_PC", "modu_leventure", 21000, NowMs(),
-                 (unsigned long)sim_ap_catalog_current_pid());
-    wifi_reason_t reason = WIFI_REASON_OK;
-    ASSERT_EQ(inst.vtable->wifi_sta_connect(inst.user, "Modu_PC", "modu_leventure", &reason),
+    /* wifi_ssid_mismatch：未连接时失败 */
+    ASSERT_EQ(inst.vtable->wifi_sta_disconnect(inst.user), DEMO_OK);
+    EXPECT_EQ(inst.vtable->inject(inst.user, "wifi_ssid_mismatch", "RogueWifi"), DEMO_ERR);
+    /* 连接后注入生效 */
+    ASSERT_EQ(inst.vtable->wifi_sta_connect(inst.user, "TactileFactory-2.4G",
+                                            "modutech_leventure", &reason),
               DEMO_OK);
-    ASSERT_EQ(inst.vtable->inject(inst.user, "wifi_ssid_mismatch", "RogueWifi"), DEMO_OK);
+    EXPECT_EQ(inst.vtable->inject(inst.user, "wifi_ssid_mismatch", "RogueWifi"), DEMO_OK);
     char ssid[33];
     EXPECT_EQ(inst.vtable->wifi_get_current_ssid(inst.user, ssid, sizeof(ssid)), DEMO_OK);
     EXPECT_STREQ(ssid, "RogueWifi");
 
     /* mcast_block / mcast_unblock */
     void *mcast = nullptr;
-    ASSERT_EQ(inst.vtable->udp_mcast_join(inst.user, kMcastGroup, kMcastPort, &mcast), DEMO_OK);
+    ASSERT_EQ(inst.vtable->udp_mcast_join(inst.user, PROTO_MCAST_GROUP, PROTO_MCAST_PORT, &mcast), DEMO_OK);
     ASSERT_EQ(inst.vtable->inject(inst.user, "mcast_block", nullptr), DEMO_OK);
     uint8_t buf[64];
     EXPECT_EQ(inst.vtable->udp_recv(inst.user, mcast, buf, sizeof(buf), nullptr), DEMO_ERR_AGAIN);
@@ -574,25 +353,25 @@ TEST(SimBackend, InjectActions)
 TEST(SimBackend, MdnsRegisterResolveViaVtable)
 {
     std::string root = MakeTempDir("simbackend");
-    device_backend_instance_t inst = Create(Opts(root, 0));
+    device_backend_instance_t inst = Create(Opts(root, 0, 21000));
 
     net_mdns_service_t svc;
     memset(&svc, 0, sizeof(svc));
     snprintf(svc.instance, sizeof(svc.instance), "host");
-    snprintf(svc.type, sizeof(svc.type), "%s", kMdnsType);
-    svc.addr.ip = inet_addr(PROTO_PC_AP_IP);
+    snprintf(svc.type, sizeof(svc.type), PROTO_MDNS_TYPE);
+    svc.addr.ip = 0x3201A8C0;
     svc.addr.port = htons(PROTO_TCP_PORT);
     snprintf(svc.txt, sizeof(svc.txt), "hello=1");
     ASSERT_EQ(inst.vtable->mdns_register(inst.user, &svc), DEMO_OK);
 
     net_mdns_service_t out;
-    EXPECT_EQ(inst.vtable->mdns_resolve(inst.user, kMdnsType, &out, 500), DEMO_OK);
+    EXPECT_EQ(inst.vtable->mdns_resolve(inst.user, PROTO_MDNS_TYPE, &out, 500), DEMO_OK);
     EXPECT_EQ(out.addr.ip, svc.addr.ip);
     EXPECT_EQ(out.addr.port, svc.addr.port);
     EXPECT_STREQ(out.instance, "host");
 
-    ASSERT_EQ(inst.vtable->mdns_unregister(inst.user, kMdnsType), DEMO_OK);
-    EXPECT_EQ(inst.vtable->mdns_resolve(inst.user, kMdnsType, &out, 100), DEMO_ERR_TIMEOUT);
+    ASSERT_EQ(inst.vtable->mdns_unregister(inst.user, PROTO_MDNS_TYPE), DEMO_OK);
+    EXPECT_EQ(inst.vtable->mdns_resolve(inst.user, PROTO_MDNS_TYPE, &out, 100), DEMO_ERR_TIMEOUT);
     Destroy(&inst);
 }
 
@@ -600,13 +379,13 @@ TEST(SimBackend, NvsPersistAcrossBackends)
 {
     std::string root = MakeTempDir("simbackend");
     {
-        device_backend_instance_t inst = Create(Opts(root, 0));
+        device_backend_instance_t inst = Create(Opts(root, 0, 21000));
         const char *v = "persist-me";
         ASSERT_EQ(inst.vtable->nvs_set(inst.user, "persist", (const uint8_t *)v, (int)strlen(v)), DEMO_OK);
         Destroy(&inst);
     }
     {
-        device_backend_instance_t inst = Create(Opts(root, 0));
+        device_backend_instance_t inst = Create(Opts(root, 0, 21000));
         uint8_t buf[64];
         int len = (int)sizeof(buf);
         EXPECT_EQ(inst.vtable->nvs_get(inst.user, "persist", buf, &len), DEMO_OK);
@@ -614,4 +393,52 @@ TEST(SimBackend, NvsPersistAcrossBackends)
         EXPECT_EQ(memcmp(buf, "persist-me", 10), 0);
         Destroy(&inst);
     }
+}
+
+TEST(SimBackend, WifiScanMergesWorldCatalogTarget)
+{
+    std::string root = MakeTempDir("simbackend");
+    device_backend_instance_t a = Create(Opts(root, 0, 21000));
+    device_backend_instance_t b = Create(Opts(root, 1, 21001));
+
+    ASSERT_EQ(a.vtable->wifi_ap_start(a.user, "Modu_ScanA", "pass123456", "1234"), DEMO_OK);
+
+    net_ap_info_t aps[16];
+    int count = 16;
+    EXPECT_EQ(b.vtable->wifi_scan(b.user, aps, &count), DEMO_OK);
+    /* B 扫描：catalog 的 Modu_ScanA + 目标网络 */
+    bool saw_ap = false, saw_target = false;
+    for (int i = 0; i < count; i++) {
+        if (strcmp(aps[i].ssid, "Modu_ScanA") == 0)
+            saw_ap = true;
+        if (strcmp(aps[i].ssid, "TactileFactory-2.4G") == 0)
+            saw_target = true;
+    }
+    EXPECT_TRUE(saw_ap);
+    EXPECT_TRUE(saw_target);
+
+    /* 容量 0 时 count 仍统计全部 */
+    count = 0;
+    EXPECT_EQ(b.vtable->wifi_scan(b.user, nullptr, &count), DEMO_OK);
+    EXPECT_GE(count, 2);
+
+    Destroy(&a);
+    Destroy(&b);
+}
+
+TEST(SimBackend, StaConnectViaCatalog)
+{
+    std::string root = MakeTempDir("simbackend");
+    device_backend_instance_t a = Create(Opts(root, 0, 21000));
+    device_backend_instance_t b = Create(Opts(root, 1, 21001));
+    ASSERT_EQ(a.vtable->wifi_ap_start(a.user, "Modu_Cat", "pass123456", "1234"), DEMO_OK);
+    wifi_reason_t reason = WIFI_REASON_OK;
+    /* B 通过 catalog 发现并连接 A 的 AP（冻结 schema 无密码字段，命中即成功） */
+    EXPECT_EQ(b.vtable->wifi_sta_connect(b.user, "Modu_Cat", "wrongpass", &reason), DEMO_OK);
+    EXPECT_EQ((int)reason, 0);
+    char cur[33];
+    EXPECT_EQ(b.vtable->wifi_get_current_ssid(b.user, cur, sizeof(cur)), DEMO_OK);
+    EXPECT_STREQ(cur, "Modu_Cat");
+    Destroy(&a);
+    Destroy(&b);
 }

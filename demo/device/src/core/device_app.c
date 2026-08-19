@@ -1,6 +1,8 @@
 #include "device_app.h"
 #include "device_eventlog.h"
 #include "device_limits.h"
+#include "device_provision.h"
+#include "device_discovery.h"
 #include "device_session.h"
 #include "device_heal.h"
 #include "log.h"
@@ -138,31 +140,6 @@ uint32_t device_app_uptime_s(const device_app_t *app)
     return (uint32_t)((net_time_ms(app->net) - app->uptime_start_ms) / 1000);
 }
 
-/* IPv4 uint32 → "a.b.c.d"（仅用于日志/事件展示）。
- * 约定与 net_abstraction.h / sim_world / linux_wifi 一致：ip 内存字节序即点分
- * 四段顺序（等价 inet_addr 结果），因此低位字节是最左段。 */
-static void ipv4_str(uint32_t ip, char *out, size_t cap)
-{
-    snprintf(out, cap, "%u.%u.%u.%u",
-             ip & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF, (ip >> 24) & 0xFF);
-}
-
-/* 安全 IPv4 解析（拒绝负号、越界、多余字段）；成功写入网络字节序 uint32
- * （与 sim_world_pc_ap_ip/linux_wifi_get_ip 同一字节序约定）。 */
-static int parse_ipv4(const char *s, uint32_t *out)
-{
-    unsigned a = 0, b = 0, c = 0, d = 0;
-    char extra = '\0';
-    if (s == NULL || out == NULL)
-        return DEMO_ERR_INVAL;
-    if (sscanf(s, "%u.%u.%u.%u%c", &a, &b, &c, &d, &extra) != 4)
-        return DEMO_ERR_INVAL;
-    if (a > 255 || b > 255 || c > 255 || d > 255)
-        return DEMO_ERR_INVAL;
-    *out = ((uint32_t)d << 24) | ((uint32_t)c << 16) | ((uint32_t)b << 8) | (uint32_t)a;
-    return DEMO_OK;
-}
-
 int device_app_tx_text(device_app_t *app, const char *text)
 {
     if (app == NULL || text == NULL || text[0] == '\0')
@@ -205,12 +182,13 @@ void device_set_state(device_app_t *app, device_state_t s)
     app->state = s;
     app->state_enter_ms = net_time_ms(app->net);
     app->snap_state = (int)s; /* 状态快照同步 */
-    if (s == DEV_STATE_HEAL) {
+    if (s == DEV_STATE_HEAL)
         app->heal_enter_ms = app->state_enter_ms;
-        app->heal_wait_ms = 0; /* 进入 HEAL 时重置退避等待，下一轮重算 */
-    }
     if (s == DEV_STATE_SESSION)
+    {
+        app->cred_confirm_done = 0;
         app->session_ack_ok = 0;
+    }
 }
 
 device_state_t device_app_get_state(const device_app_t *app) { return app->state; }
@@ -239,9 +217,9 @@ int device_send_frame(device_app_t *app, void *sock, cJSON *obj)
     return rc;
 }
 
-/* ---------------- 收包统一入口（仅业务会话） ---------------- */
+/* ---------------- 收包统一入口 ---------------- */
 
-void device_app_handle_rx(device_app_t *app, void *sock)
+void device_app_handle_rx(device_app_t *app, void *sock, int is_business)
 {
     uint8_t buf[512];
     int n = net_sock_recv(app->net, sock, buf, (int)sizeof(buf));
@@ -251,7 +229,10 @@ void device_app_handle_rx(device_app_t *app, void *sock)
         /* 连接关闭：通知会话层（由状态机处理） */
         app->rx_len = 0; /* 清残留帧缓冲 */
         app->rx_sock = sock;
-        session_on_conn_closed(app);
+        if (is_business)
+            session_on_conn_closed(app);
+        else
+            prov_server_on_conn_closed(app);
         app->rx_sock = NULL;
         return;
     }
@@ -264,8 +245,12 @@ void device_app_handle_rx(device_app_t *app, void *sock)
         if (app->malformed_count >= app->params->malformed_max_per_conn) {
             LOG_W(app->device_id, "畸形报文过多，关闭连接");
             net_sock_close(app->net, sock);
-            app->sess_sock = NULL;
-            session_on_conn_closed(app);
+            if (is_business) {
+                app->sess_sock = NULL;
+                session_on_conn_closed(app);
+            } else {
+                prov_server_on_conn_closed(app);
+            }
             app->rx_sock = NULL;
             return;
         }
@@ -288,8 +273,12 @@ void device_app_handle_rx(device_app_t *app, void *sock)
                 LOG_W(app->device_id, "畸形报文过多，关闭连接");
                 net_sock_close(app->net, sock);
                 app->rx_len = 0;
-                app->sess_sock = NULL;
-                session_on_conn_closed(app);
+                if (is_business) {
+                    app->sess_sock = NULL;
+                    session_on_conn_closed(app);
+                } else {
+                    prov_server_on_conn_closed(app);
+                }
                 app->rx_sock = NULL;
                 return;
             }
@@ -312,7 +301,11 @@ void device_app_handle_rx(device_app_t *app, void *sock)
                 LOG_W(app->device_id, "消息缺少 cmd 字段");
             } else {
                 LOG_I(app->device_id, "RX %s", cmdname);
-                session_on_msg(app, json);
+                if (is_business) {
+                    session_on_msg(app, json);
+                } else {
+                    prov_server_on_msg(app, json);
+                }
             }
             cJSON_Delete(json);
         }
@@ -323,7 +316,7 @@ void device_app_handle_rx(device_app_t *app, void *sock)
     app->rx_sock = NULL;
 }
 
-/* ---------------- NVS 读写（JSON blob，事件日志持久化用） ---------------- */
+/* ---------------- NVS 读写（JSON blob） ---------------- */
 
 static int nvs_read_json(device_app_t *app, const char *key, cJSON **out)
 {
@@ -338,6 +331,225 @@ static int nvs_read_json(device_app_t *app, const char *key, cJSON **out)
         return DEMO_ERR;
     *out = j;
     return DEMO_OK;
+}
+
+static int nvs_write_json(device_app_t *app, const char *key, cJSON *obj)
+{
+    char *s = cJSON_PrintUnformatted(obj);
+    if (s == NULL)
+        return DEMO_ERR_NOMEM;
+    int rc = net_nvs_set(app->net, key, (const uint8_t *)s, (int)strlen(s));
+    free(s);
+    return rc;
+}
+
+static int creds_save(device_app_t *app)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (root == NULL)
+        return DEMO_ERR_NOMEM;
+    cJSON_AddNumberToObject(root, "schema", 1);
+    cJSON *arr = cJSON_AddArrayToObject(root, "creds");
+    for (int i = 0; i < app->cred_count; i++) {
+        cJSON *it = cJSON_CreateObject();
+        cJSON_AddStringToObject(it, "ssid", app->creds[i]);
+        cJSON_AddStringToObject(it, "password", app->cred_pass[i]);
+        cJSON_AddNumberToObject(it, "confirmed", app->cred_confirmed[i]);
+        cJSON_AddItemToArray(arr, it);
+    }
+    int rc = nvs_write_json(app, "wifi_creds", root);
+    cJSON_Delete(root);
+    return rc;
+}
+
+static void creds_remove(device_app_t *app, int index)
+{
+    if (index < 0 || index >= app->cred_count)
+        return;
+    for (int i = index; i < app->cred_count - 1; i++) {
+        snprintf(app->creds[i], sizeof(app->creds[i]), "%s", app->creds[i + 1]);
+        snprintf(app->cred_pass[i], sizeof(app->cred_pass[i]), "%s", app->cred_pass[i + 1]);
+        app->cred_confirmed[i] = app->cred_confirmed[i + 1];
+    }
+    app->cred_count--;
+    app->creds[app->cred_count][0] = '\0';
+    app->cred_pass[app->cred_count][0] = '\0';
+    app->cred_confirmed[app->cred_count] = 0;
+    if (app->cred_active >= app->cred_count)
+        app->cred_active = 0;
+}
+
+/* 凭据持久化：{ "schema":1, "creds":[ {ssid,password,confirmed}, ... ] } */
+void device_creds_reload(device_app_t *app)
+{
+    app->cred_count = 0;
+    app->cred_active = 0;
+    cJSON *j = NULL;
+    if (nvs_read_json(app, "wifi_creds", &j) != DEMO_OK)
+        return;
+    const cJSON *arr = cJSON_GetObjectItemCaseSensitive(j, "creds");
+    if (cJSON_IsArray(arr)) {
+        int n = 0;
+        const cJSON *it;
+        cJSON_ArrayForEach(it, arr) {
+            if (n >= PROTO_WIFI_CRED_MAX)
+                break;
+            const cJSON *ssid = cJSON_GetObjectItemCaseSensitive(it, "ssid");
+            const cJSON *pass = cJSON_GetObjectItemCaseSensitive(it, "password");
+            const cJSON *cfm = cJSON_GetObjectItemCaseSensitive(it, "confirmed");
+            if (!cJSON_IsString(ssid) || !cJSON_IsString(pass))
+                continue;
+            snprintf(app->creds[n], sizeof(app->creds[n]), "%s", ssid->valuestring);
+            snprintf(app->cred_pass[n], sizeof(app->cred_pass[n]), "%s", pass->valuestring);
+            app->cred_confirmed[n] = (cJSON_IsNumber(cfm) && cfm->valueint != 0) ? 1 : 0;
+            n++;
+        }
+        app->cred_count = n;
+    }
+    cJSON_Delete(j);
+
+    /* 未确认即重启必须回滚；没有 last-known-good 时清除并重新配网。 */
+    int rolled_back = 0;
+    for (int i = 0; i < app->cred_count; i++) {
+        if (!app->cred_confirmed[i]) {
+            evlog_record(app, "未确认的网络凭据已回滚");
+            LOG_W(app->device_id, "网络凭据已回滚：%s", app->creds[i]);
+            creds_remove(app, i);
+            rolled_back = 1;
+            i--;
+        }
+    }
+    if (rolled_back) {
+        if (app->cred_count > 0)
+            creds_save(app);
+        else
+            net_nvs_erase(app->net, "wifi_creds");
+    }
+}
+
+static void creds_clear_all(device_app_t *app)
+{
+    net_nvs_erase(app->net, "wifi_creds");
+    app->cred_count = 0;
+    app->cred_active = 0;
+    for (int i = 0; i < PROTO_WIFI_CRED_MAX; i++) {
+        app->creds[i][0] = '\0';
+        app->cred_pass[i][0] = '\0';
+        app->cred_confirmed[i] = 0;
+    }
+    evlog_record(app, "所有网络凭据已清除");
+}
+
+static int wifi_matches_credential(device_app_t *app, int index, char *actual_ssid,
+                                   int actual_ssid_capacity)
+{
+    char current_ssid[33] = {0};
+    if (index < 0 || index >= app->cred_count ||
+        net_wifi_get_current_ssid(app->net, current_ssid, (int)sizeof(current_ssid)) != DEMO_OK)
+        return 0;
+    if (actual_ssid && actual_ssid_capacity > 0)
+        snprintf(actual_ssid, (size_t)actual_ssid_capacity, "%s", current_ssid);
+    if (strcmp(current_ssid, app->creds[index]) != 0) {
+        LOG_W(app->device_id, "WiFi SSID 不匹配：期望=%s，实际=%s",
+              app->creds[index], current_ssid);
+        return 0;
+    }
+    return 1;
+}
+
+static int wifi_connection_is_valid(device_app_t *app, char *actual_ssid,
+                                    int actual_ssid_capacity)
+{
+    uint32_t ip = 0;
+    if (actual_ssid && actual_ssid_capacity > 0)
+        actual_ssid[0] = '\0';
+    return net_wifi_get_ip(app->net, &ip) == DEMO_OK && ip != 0 &&
+           wifi_matches_credential(app, app->cred_active, actual_ssid,
+                                   actual_ssid_capacity);
+}
+
+static int ensure_expected_wifi_or_recover(device_app_t *app, const char *stage,
+                                           int reprovision_if_disconnected)
+{
+    char actual_ssid[33] = {0};
+    if (wifi_connection_is_valid(app, actual_ssid, (int)sizeof(actual_ssid)))
+        return 1;
+
+    const char *expected = (app->cred_active >= 0 && app->cred_active < app->cred_count)
+        ? app->creds[app->cred_active] : "<无>";
+    if (actual_ssid[0] == '\0' && !reprovision_if_disconnected) {
+        LOG_W(app->device_id, "%s：目标 WiFi 已断开，返回 STA 重连流程（期望=%s）",
+              stage, expected);
+        evlog_record(app, "%s：目标 WiFi 已断开，返回 STA 重连", stage);
+        session_disconnect(app);
+        discovery_stop(app);
+        app->wifi_retry_count = 0;
+        device_set_state(app, DEV_STATE_STA_JOIN);
+        return 0;
+    }
+    LOG_W(app->device_id,
+          "%s：目标 WiFi 校验失败，期望=%s，实际=%s；清除凭据并重新开启配网热点",
+          stage, expected, actual_ssid[0] ? actual_ssid : "<未连接>");
+    evlog_record(app, "%s：目标 WiFi 校验失败，清除凭据并重新配网", stage);
+    session_disconnect(app);
+    discovery_stop(app);
+    net_wifi_sta_disconnect(app->net);
+    creds_clear_all(app);
+    app->provision_confirm_deadline_ms = 0;
+    app->provision_auth_ok = 0;
+    app->provision_wifi_ok = 0;
+    device_set_state(app, DEV_STATE_AP_PROVISION);
+    return 0;
+}
+
+static void rollback_unconfirmed_credential(device_app_t *app, const char *reason)
+{
+    int index = app->cred_active;
+    if (index < 0 || index >= app->cred_count || app->cred_confirmed[index])
+        return;
+    evlog_record(app, "未确认网络已移除：%s（%s）", app->creds[index], reason);
+    session_disconnect(app);
+    net_wifi_sta_disconnect(app->net);
+    creds_remove(app, index);
+    app->provision_confirm_deadline_ms = 0;
+    if (app->cred_count > 0) {
+        creds_save(app);
+        app->cred_active = 0;
+        app->wifi_retry_count = 0;
+        device_set_state(app, DEV_STATE_STA_JOIN);
+    } else {
+        net_nvs_erase(app->net, "wifi_creds");
+        device_set_state(app, DEV_STATE_AP_PROVISION);
+    }
+}
+
+static void candidates_load(device_app_t *app)
+{
+    app->candidate_count = 0;
+    cJSON *j = NULL;
+    if (nvs_read_json(app, "host_candidates", &j) != DEMO_OK)
+        return;
+    const cJSON *arr = cJSON_GetObjectItemCaseSensitive(j, "candidates");
+    if (cJSON_IsArray(arr)) {
+        int n = 0;
+        const cJSON *it;
+        cJSON_ArrayForEach(it, arr) {
+            if (n >= PROTO_CANDIDATE_MAX)
+                break;
+            const cJSON *ip = cJSON_GetObjectItemCaseSensitive(it, "ip");
+            const cJSON *port = cJSON_GetObjectItemCaseSensitive(it, "port");
+            if (!cJSON_IsString(ip) || !cJSON_IsNumber(port))
+                continue;
+            unsigned a, b, c, d;
+            if (sscanf(ip->valuestring, "%u.%u.%u.%u", &a, &b, &c, &d) != 4)
+                continue;
+            app->candidate_list[n].ip = (uint32_t)((d << 24) | (c << 16) | (b << 8) | a);
+            app->candidate_list[n].port = htons((uint16_t)port->valueint);
+            n++;
+        }
+        app->candidate_count = n;
+    }
+    cJSON_Delete(j);
 }
 
 /* ---------------- 生命周期 ---------------- */
@@ -360,14 +572,16 @@ device_app_t *device_app_create(const device_config_t *params, net_ctx_t *net,
     app->heartbeat_dead_ms = params->heartbeat_dead_ms > 0
         ? params->heartbeat_dead_ms
         : params->heartbeat_interval_ms * 3 / 2;
-
-    /* 固定上位机地址：pc_host_ip:host_tcp_port → 网络字节序。
-     * 配置校验（device_config_validate）已保证 ip/port 为契约值；此处仅做安全解析。 */
-    app->sess_host.ip = 0;
-    app->sess_host.port = dev_htons((uint16_t)params->host_tcp_port);
-    if (parse_ipv4(params->pc_host_ip, &app->sess_host.ip) != DEMO_OK) {
-        LOG_E(app->device_id, "固定上位机地址非法：%s", params->pc_host_ip);
-        app->sess_host.ip = 0;
+    /* 热点名 = Modu_ + MAC 最后两个十六进制字节（去冒号，大写） */
+    {
+        size_t len = strlen(device_id);
+        char tail[5];
+        tail[0] = (char)toupper((unsigned char)device_id[len - 5]);
+        tail[1] = (char)toupper((unsigned char)device_id[len - 4]);
+        tail[2] = (char)toupper((unsigned char)device_id[len - 2]);
+        tail[3] = (char)toupper((unsigned char)device_id[len - 1]);
+        tail[4] = '\0';
+        snprintf(app->ap_ssid, sizeof(app->ap_ssid), "Modu_%s", tail);
     }
 
     /* 从 NVS 恢复事件日志（环形缓冲持久化语义），再记录上电事件 */
@@ -397,6 +611,8 @@ device_app_t *device_app_create(const device_config_t *params, net_ctx_t *net,
         }
     }
     evlog_record(app, "设备上电");
+    device_creds_reload(app);
+    candidates_load(app);
     return app;
 }
 
@@ -405,10 +621,15 @@ void device_app_destroy(device_app_t *app)
     if (app == NULL)
         return;
     evlog_flush(app);
+    if (app->mcast_sock) {
+        net_sock_close(app->net, app->mcast_sock);
+        app->mcast_sock = NULL;
+    }
     if (app->sess_sock) {
         net_sock_close(app->net, app->sess_sock);
         app->sess_sock = NULL;
     }
+    prov_server_stop(app);
     free(app);
 }
 
@@ -420,154 +641,199 @@ void device_app_request_stop(device_app_t *app)
 
 /* ---------------- 状态机 ---------------- */
 
-/* WiFi 有效：已连接且 IP 非 0 且实际 SSID 精确匹配目标。 */
-static int wifi_connection_is_valid(device_app_t *app, char *actual_ssid,
-                                    int actual_ssid_capacity)
-{
-    uint32_t ip = 0;
-    char ssid[33] = {0};
-    if (actual_ssid && actual_ssid_capacity > 0)
-        actual_ssid[0] = '\0';
-    if (net_wifi_get_ip(app->net, &ip) != DEMO_OK || ip == 0)
-        return 0;
-    if (net_wifi_get_current_ssid(app->net, ssid, (int)sizeof(ssid)) != DEMO_OK)
-        return 0;
-    if (strcmp(ssid, app->params->pc_ap_ssid) != 0)
-        return 0;
-    if (actual_ssid && actual_ssid_capacity > 0)
-        snprintf(actual_ssid, (size_t)actual_ssid_capacity, "%s", ssid);
-    return 1;
-}
-
-/* WiFi 扫描退避（指数，上限 cap，附加抖动）。 */
-static long wifi_backoff_delay_ms(const device_app_t *app)
-{
-    int n = app->wifi_retry_count > 0 ? app->wifi_retry_count - 1 : 0;
-    if (n > app->params->wifi_retry_max)
-        n = app->params->wifi_retry_max;
-    long delay = (long)app->params->wifi_backoff_base_ms;
-    for (int i = 0; i < n; i++) {
-        delay *= 2;
-        if (delay > (long)app->params->wifi_backoff_cap_ms) {
-            delay = (long)app->params->wifi_backoff_cap_ms;
-            break;
-        }
-    }
-    if (delay > (long)app->params->wifi_backoff_cap_ms)
-        delay = (long)app->params->wifi_backoff_cap_ms;
-    delay += (long)(net_random(app->net) %
-                    (uint32_t)(app->params->wifi_backoff_jitter_ms + 1));
-    return delay;
-}
-
 static void sm_boot(device_app_t *app)
 {
     uint64_t now = net_time_ms(app->net);
     if (app->state_enter_ms == 0)
         app->state_enter_ms = now;
+    /* 热点/配网失败退避（provision_ap_backoff） */
+    if (app->boot_backoff_until > now)
+        return;
     /* 上电错峰 */
     if (now - app->state_enter_ms < (uint64_t)app->params->power_on_jitter_max_ms)
         return;
-    app->wifi_retry_count = 0; /* 首次扫描立即执行 */
-    device_set_state(app, DEV_STATE_WIFI_SCAN);
-}
-
-static void sm_wifi_scan(device_app_t *app)
-{
-    uint64_t now = net_time_ms(app->net);
-    /* 退避门禁：失败后在退避期满前驻留，不重复扫描 */
-    if (app->wifi_retry_count > 0) {
-        long delay = wifi_backoff_delay_ms(app);
-        if (now - app->state_enter_ms < (uint64_t)delay)
-            return;
-    }
-
-    device_app_publish_event(app, "wifi_scan_started", "ok", 0, NULL);
-    net_ap_info_t aps[DEVICE_SCAN_MAX_APS];
-    int count = DEVICE_SCAN_MAX_APS;
-    int found = -1;
-    if (net_wifi_scan(app->net, aps, &count) == DEMO_OK) {
-        for (int i = 0; i < count && i < DEVICE_SCAN_MAX_APS; i++) {
-            if (aps[i].band_2g &&
-                strcmp(aps[i].ssid, app->params->pc_ap_ssid) == 0) {
-                found = i;
-                break;
-            }
-        }
-    }
-
-    if (found >= 0) {
-        char data[96];
-        snprintf(data, sizeof(data), "{\"ssid\":\"%s\",\"rssi\":%d}",
-                 app->params->pc_ap_ssid, aps[found].rssi);
-        device_app_publish_event(app, "wifi_target_found", "ok", 0, data);
-        evlog_record(app, "发现目标热点：%s", app->params->pc_ap_ssid);
-        app->wifi_retry_count = 0;
+    if (app->cred_count > 0) {
+        app->cred_active = 0;
         device_set_state(app, DEV_STATE_STA_JOIN);
-        return;
+    } else {
+        device_set_state(app, DEV_STATE_AP_PROVISION);
     }
-
-    evlog_record(app, "未发现目标热点，继续扫描（第 %d 次）", app->wifi_retry_count + 1);
-    app->wifi_retry_count++;
-    app->state_enter_ms = now; /* 退避窗口起点 */
 }
 
 static void sm_sta_join(device_app_t *app)
 {
+    uint64_t now = net_time_ms(app->net);
+    /* 退避门禁：上次尝试失败后，在退避期满前驻留，不发起新的连接尝试 */
+    if (app->wifi_retry_count > 0) {
+        int base = app->params->wifi_backoff_base_ms;
+        int cap = app->params->wifi_backoff_cap_ms;
+        long delay = (long)base << (app->wifi_retry_count - 1);
+        if (delay > cap) delay = cap;
+        delay += (long)(net_random(app->net) % (uint32_t)(app->params->wifi_backoff_jitter_ms + 1));
+        if (now - app->state_enter_ms < (uint64_t)delay)
+            return;
+    }
     wifi_reason_t reason = WIFI_REASON_OK;
-    int rc = net_wifi_sta_connect(app->net, app->params->pc_ap_ssid,
-                                  app->params->pc_ap_password, &reason);
-    if (rc != DEMO_OK) {
-        char data[64];
-        snprintf(data, sizeof(data), "{\"reason\":%d}", (int)reason);
-        device_app_publish_event(app, "wifi_connect_failed", "fail", (int)reason, data);
-        evlog_record(app, "WiFi 连接失败（reason=%d）：%s", (int)reason,
-                     app->params->pc_ap_ssid);
-        if (reason == WIFI_REASON_AUTH_FAIL)
-            app->err_auth_fails++;
-        else
+    int rc = net_wifi_sta_connect(app->net, app->creds[app->cred_active],
+                                  app->cred_pass[app->cred_active], &reason);
+    if (rc == DEMO_OK) {
+        uint32_t ip = 0;
+        net_wifi_get_ip(app->net, &ip);
+        if (ip == 0 || !wifi_matches_credential(app, app->cred_active, NULL, 0)) {
+            evlog_record(app, "WiFi 连接校验失败：%s", app->creds[app->cred_active]);
+            net_wifi_sta_disconnect(app->net);
             app->err_wifi_disconnects++;
-        app->wifi_retry_count++;
-        device_set_state(app, DEV_STATE_HEAL);
+            app->cred_active++;
+            app->wifi_retry_count = 0;
+            if (app->cred_active >= app->cred_count) {
+                evlog_record(app, "所有网络凭据均不可用，进入配网模式");
+                creds_clear_all(app);
+                device_set_state(app, DEV_STATE_AP_PROVISION);
+            }
+            return;
+        }
+        evlog_record(app, "WiFi 已连接：%s", app->creds[app->cred_active]);
+        app->wifi_retry_count = 0;
+        discovery_start(app);
+        device_set_state(app, DEV_STATE_DISCOVERY);
         return;
     }
-
-    uint32_t ip = 0;
-    char actual_ssid[33] = {0};
-    if (!wifi_connection_is_valid(app, actual_ssid, (int)sizeof(actual_ssid))) {
-        device_app_publish_event(app, "wifi_connect_failed", "fail",
-                                 WIFI_REASON_HANDSHAKE_TIMEOUT,
-                                 "{\"reason\":205}");
-        evlog_record(app, "WiFi 连接校验失败（IP/SSID）：%s", app->params->pc_ap_ssid);
-        net_wifi_sta_disconnect(app->net);
+    if (reason == WIFI_REASON_AUTH_FAIL) {
+        /* 不可恢复：切换下一凭据 */
+        evlog_record(app, "WiFi 认证失败（202）：%s", app->creds[app->cred_active]);
+        app->err_auth_fails++;
+        app->cred_active++;
+        app->wifi_retry_count = 0;
+        if (app->cred_active >= app->cred_count) {
+            evlog_record(app, "所有网络凭据均不可用，进入配网模式");
+            creds_clear_all(app);
+            device_set_state(app, DEV_STATE_AP_PROVISION);
+        }
+        return;
+    }
+    /* 可恢复：记录本次尝试时间，按指数退避等待下一轮 */
+    app->wifi_retry_count++;
+    if (app->wifi_retry_count >= app->params->wifi_retry_max) {
+        evlog_record(app, "WiFi 重试次数耗尽（%d）：%s", (int)reason,
+                     app->creds[app->cred_active]);
         app->err_wifi_disconnects++;
-        app->wifi_retry_count++;
-        device_set_state(app, DEV_STATE_HEAL);
+        app->cred_active++;
+        app->wifi_retry_count = 0;
+        if (app->cred_active >= app->cred_count) {
+            evlog_record(app, "所有网络凭据均不可用，进入配网模式");
+            creds_clear_all(app);
+            device_set_state(app, DEV_STATE_AP_PROVISION);
+        }
         return;
     }
-    net_wifi_get_ip(app->net, &ip);
-    {
-        char ipbuf[16];
-        char data[96];
-        ipv4_str(ip, ipbuf, sizeof(ipbuf));
-        snprintf(data, sizeof(data), "{\"ssid\":\"%s\",\"device_ip\":\"%s\"}",
-                 actual_ssid, ipbuf);
-        device_app_publish_event(app, "wifi_connected", "ok", 0, data);
+    app->state_enter_ms = now; /* 退避起点：下一次尝试不早于 now+delay */
+}
+
+static void sm_ap_provision(device_app_t *app)
+{
+    uint64_t now = net_time_ms(app->net);
+    /* PIN 锁定/失败退避中：等待退避结束转 BOOT */
+    if (app->boot_backoff_until > now) {
+        if (app->ap_listen == NULL && app->ap_conn == NULL)
+            device_set_state(app, DEV_STATE_BOOT);
+        return;
     }
-    evlog_record(app, "WiFi 已连接：%s", actual_ssid);
-    app->wifi_retry_count = 0;
-    device_set_state(app, DEV_STATE_CONNECT);
+    if (app->ap_listen == NULL) {
+        int rc = prov_server_start(app);
+        if (rc != DEMO_OK) {
+            app->boot_backoff_until =
+                now + (uint64_t)app->params->provision_ap_backoff_ms;
+            evlog_record(app, "配网热点启动失败，等待 %d 毫秒后重试",
+                         app->params->provision_ap_backoff_ms);
+            device_set_state(app, DEV_STATE_BOOT);
+            return;
+        }
+        app->state_enter_ms = now;
+    }
+    int prc = prov_server_poll(app);
+    if (prc == PROV_RET_AP_LOCKED) {
+        evlog_record(app, "配网热点因 PIN 连续失败而锁定");
+        prov_server_stop(app);
+        app->state_enter_ms = now;
+        /* 热点退避 provision_ap_backoff_ms 后回 BOOT */
+        app->boot_backoff_until = now + (uint64_t)app->params->provision_ap_backoff_ms;
+        device_set_state(app, DEV_STATE_BOOT);
+        return;
+    }
+    if (app->provision_wifi_ok && app->provision_handoff_deadline_ms > 0 &&
+        now >= app->provision_handoff_deadline_ms) {
+        LOG_I(app->device_id, "配网：未收到 close_ap，设备主动完成交接");
+        evlog_record(app, "未收到 close_ap，设备主动完成配网交接");
+        prov_server_stop(app);
+    }
+    /* 配网完成（wifi_config 成功 + close_ap 后 ap_listen 被置空且认证已通过）：
+     * 必须同时满足 auth_ok 与 wifi_ok，防止未配置 WiFi 就被 close_ap 误入发现阶段 */
+    if (app->ap_listen == NULL && app->provision_auth_ok) {
+        if (!app->provision_wifi_ok) {
+            /* 过早 close_ap（未完成 wifi_config）：视为配网失败，退避后重新开 AP */
+            LOG_W(app->device_id, "配网：收到 close_ap 但未完成 wifi_config，视为配网失败");
+            evlog_record(app, "配网中断（未完成 wifi_config）");
+            app->boot_backoff_until = now + (uint64_t)app->params->provision_ap_backoff_ms;
+            device_set_state(app, DEV_STATE_BOOT);
+            return;
+        }
+        if (!ensure_expected_wifi_or_recover(app, "关闭热点前", 1))
+            return;
+        /* 写确认标记（配网确认窗口开始计时：由 SESSION 建立后确认） */
+        evlog_record(app, "配网完成，进入服务发现阶段");
+        discovery_start(app);
+        device_set_state(app, DEV_STATE_DISCOVERY);
+        return;
+    }
+    /* AP 空闲超时 → 关 AP 退避（配置为 0 表示持续开启：仅配网完成 close_ap 或 PIN 锁定才停止） */
+    if (app->params->provision_ap_idle_timeout_ms > 0 &&
+        app->ap_listen != NULL &&
+        now - app->state_enter_ms >= (uint64_t)app->params->provision_ap_idle_timeout_ms) {
+        evlog_record(app, "配网热点空闲超时");
+        prov_server_stop(app);
+        app->boot_backoff_until = now + (uint64_t)app->params->provision_ap_backoff_ms;
+        device_set_state(app, DEV_STATE_BOOT);
+    }
+}
+
+static void sm_discovery(device_app_t *app)
+{
+    uint64_t now = net_time_ms(app->net);
+    if (!ensure_expected_wifi_or_recover(app, "服务发现前", 0))
+        return;
+    if (app->cred_count > 0 && !app->cred_confirmed[app->cred_active] &&
+        app->provision_confirm_deadline_ms > 0 &&
+        now >= app->provision_confirm_deadline_ms) {
+        rollback_unconfirmed_credential(app, "确认窗口内未连接上位机");
+        return;
+    }
+    int rc = discovery_poll(app);
+    if (rc == 1) {
+        evlog_record(app, "发现上位机：%u.%u.%u.%u:%u",
+                     app->sess_host.ip & 0xFF, (app->sess_host.ip >> 8) & 0xFF,
+                     (app->sess_host.ip >> 16) & 0xFF, (app->sess_host.ip >> 24) & 0xFF,
+                     dev_ntohs(app->sess_host.port));
+        device_set_state(app, DEV_STATE_CONNECT);
+        return;
+    }
+    /* 看门狗（发现超长驻留） */
+    if (now - app->state_enter_ms > (uint64_t)app->params->watchdog_state_timeout_ms) {
+        LOG_W(app->device_id, "看门狗：服务发现阶段停留过久，重新开始发现");
+        evlog_record(app, "服务发现阶段看门狗超时");
+        discovery_start(app);
+        app->state_enter_ms = now;
+    }
 }
 
 static void sm_connect(device_app_t *app)
 {
-    {
-        char ipbuf[16];
-        char data[96];
-        ipv4_str(app->sess_host.ip, ipbuf, sizeof(ipbuf));
-        snprintf(data, sizeof(data), "{\"host\":\"%s\",\"port\":%d}",
-                 ipbuf, (int)dev_ntohs(app->sess_host.port));
-        device_app_publish_event(app, "tcp_connecting", "ok", 0, data);
+    uint64_t now = net_time_ms(app->net);
+    if (!ensure_expected_wifi_or_recover(app, "连接上位机前", 0))
+        return;
+    if (app->cred_count > 0 && !app->cred_confirmed[app->cred_active] &&
+        app->provision_confirm_deadline_ms > 0 && now >= app->provision_confirm_deadline_ms) {
+        rollback_unconfirmed_credential(app, "确认窗口内未建立上位机会话");
+        return;
     }
     int rc = session_connect(app, &app->sess_host);
     if (rc == DEMO_OK) {
@@ -582,14 +848,12 @@ static void sm_connect(device_app_t *app)
 
 static void sm_session(device_app_t *app)
 {
-    /* WiFi 失效直接断开并进入 HEAL（HEAL 会判定回扫描） */
-    if (!wifi_connection_is_valid(app, NULL, 0)) {
-        evlog_record(app, "会话期间 WiFi 失效，进入自愈阶段");
-        device_app_publish_event(app, "session_offline", "ok", 0,
-                                 "{\"reason\":\"wifi_lost\"}");
-        session_disconnect(app);
-        heal_on_disconnect(app, "WiFi 失效");
-        device_set_state(app, DEV_STATE_HEAL);
+    uint64_t now = net_time_ms(app->net);
+    if (!ensure_expected_wifi_or_recover(app, "会话保活", 0))
+        return;
+    if (app->cred_count > 0 && !app->cred_confirmed[app->cred_active] &&
+        app->provision_confirm_deadline_ms > 0 && now >= app->provision_confirm_deadline_ms) {
+        rollback_unconfirmed_credential(app, "确认窗口内未收到 host_ack");
         return;
     }
     int alive = session_poll(app);
@@ -600,6 +864,20 @@ static void sm_session(device_app_t *app)
         heal_on_disconnect(app, "会话丢失");
         device_set_state(app, DEV_STATE_HEAL);
         return;
+    }
+    /* 只有收到 host_ack status=ok 后，凭据才成为 last-known-good。 */
+    if (app->session_ack_ok && app->cred_count > 0 &&
+        !app->cred_confirmed[app->cred_active] && !app->cred_confirm_done) {
+        app->cred_confirmed[app->cred_active] = 1;
+        app->cred_confirm_done = 1;
+        if (creds_save(app) == DEMO_OK) {
+            app->provision_confirm_deadline_ms = 0;
+            evlog_record(app, "网络凭据已确认（最近一次有效配置）");
+        } else {
+            app->cred_confirmed[app->cred_active] = 0;
+            app->cred_confirm_done = 0;
+            evlog_record(app, "网络凭据确认写入失败");
+        }
     }
     /* RSSI 监测（自愈） */
     if (heal_rssi_poll(app)) {
@@ -613,19 +891,16 @@ static void sm_session(device_app_t *app)
 static void sm_heal(device_app_t *app)
 {
     uint64_t now = net_time_ms(app->net);
-    if (!wifi_connection_is_valid(app, NULL, 0)) {
-        /* WiFi 失效：断开 STA，回扫描（按 WiFi 退避） */
-        evlog_record(app, "WiFi 失效，断开并返回扫描");
-        net_wifi_sta_disconnect(app->net);
-        app->wifi_retry_count++;
-        device_set_state(app, DEV_STATE_WIFI_SCAN);
+    if (!ensure_expected_wifi_or_recover(app, "异常自愈", 0))
+        return;
+    if (app->cred_count > 0 && !app->cred_confirmed[app->cred_active] &&
+        app->provision_confirm_deadline_ms > 0 && now >= app->provision_confirm_deadline_ms) {
+        rollback_unconfirmed_credential(app, "确认窗口内上位机会话失败");
         return;
     }
-
-    /* WiFi 健康：按 TCP 退避重连固定地址 */
-    if (app->heal_wait_ms <= 0)
-        app->heal_wait_ms = heal_next_backoff_ms(app);
-    if (now - app->state_enter_ms >= (uint64_t)app->heal_wait_ms) {
+    /* 退避到期后重连 */
+    int delay = heal_next_backoff_ms(app);
+    if (now - app->state_enter_ms >= (uint64_t)delay) {
         int rc = session_connect(app, &app->sess_host);
         if (rc == DEMO_OK) {
             evlog_record(app, "已重新连接上位机");
@@ -635,7 +910,12 @@ static void sm_heal(device_app_t *app)
         }
         /* 重连失败：重新计时退避 */
         app->state_enter_ms = now;
-        app->heal_wait_ms = 0;
+    }
+    /* 长时间未成功 → 回发现 */
+    if (now - app->heal_enter_ms >= (uint64_t)app->params->reconnect_to_discovery_ms) {
+        evlog_record(app, "重连超时，返回服务发现阶段");
+        discovery_start(app);
+        device_set_state(app, DEV_STATE_DISCOVERY);
     }
 }
 
@@ -656,12 +936,13 @@ int device_app_run_step(device_app_t *app)
     }
     if (now >= app->next_tick_ms) {
         switch (app->state) {
-        case DEV_STATE_BOOT:       sm_boot(app); break;
-        case DEV_STATE_WIFI_SCAN:  sm_wifi_scan(app); break;
-        case DEV_STATE_STA_JOIN:   sm_sta_join(app); break;
-        case DEV_STATE_CONNECT:    sm_connect(app); break;
-        case DEV_STATE_SESSION:    sm_session(app); break;
-        case DEV_STATE_HEAL:       sm_heal(app); break;
+        case DEV_STATE_BOOT:         sm_boot(app); break;
+        case DEV_STATE_STA_JOIN:     sm_sta_join(app); break;
+        case DEV_STATE_AP_PROVISION: sm_ap_provision(app); break;
+        case DEV_STATE_DISCOVERY:    sm_discovery(app); break;
+        case DEV_STATE_CONNECT:      sm_connect(app); break;
+        case DEV_STATE_SESSION:      sm_session(app); break;
+        case DEV_STATE_HEAL:         sm_heal(app); break;
         default: break;
         }
         app->next_tick_ms = net_time_ms(app->net) + 10;

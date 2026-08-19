@@ -6,7 +6,7 @@
 
 class QLabel;
 
-/* 配网/会话流程指示（6 个设备状态步骤，高亮当前状态）。纯展示控件。 */
+/* 配网/会话流程指示（7 个设备状态步骤，高亮当前状态）。纯展示控件。 */
 class FlowWidget : public QWidget {
     Q_OBJECT
 public:

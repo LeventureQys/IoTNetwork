@@ -1,10 +1,11 @@
 #include <gtest/gtest.h>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <string>
-#include "cJSON.h"
 #include "sim_backend.h"
+#include "sim_world.h"
 #include "params.h"
 
 #ifdef _WIN32
@@ -17,9 +18,15 @@
 
 namespace {
 
-const char *kCatalogDir = "run/pc_hotspot_catalog_test";
+std::string now_ms_str()
+{
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now().time_since_epoch())
+                  .count();
+    return std::to_string(ms);
+}
 
-void write_file(const char *dir, const char *name, const char *content)
+void write_catalog_file(const char *dir, const char *name, const char *content)
 {
     std::filesystem::create_directories(dir);
     std::string path = std::string(dir) + "/" + name;
@@ -29,135 +36,126 @@ void write_file(const char *dir, const char *name, const char *content)
     fclose(f);
 }
 
-struct CatalogFixture {
-    demo_params_t params;
-    void *user = nullptr;
-    net_ctx_t *ctx = nullptr;
+std::string record_json(const char *ssid, int index, int port, const char *logical_ip,
+                        long long published_ms, long long owner_pid)
+{
+    char device_id[32];
+    snprintf(device_id, sizeof(device_id), "02:00:00:00:00:%02d", index + 1);
+    return std::string("{\"schema\":1,\"device_index\":") + std::to_string(index) +
+           ",\"device_id\":\"" + device_id +
+           "\",\"ssid\":\"" + ssid + "\",\"bssid\":\"02:00:00:00:00:0" +
+           std::to_string(index % 10) + "\",\"logical_ip\":\"" + logical_ip +
+           "\",\"loopback_host\":\"127.0.0.1\",\"provision_port\":" + std::to_string(port) +
+           ",\"published_at_ms\":" + std::to_string(published_ms) +
+           ",\"owner_pid\":" + std::to_string(owner_pid) + "}";
+}
 
-    void Init()
-    {
-        params_defaults(&params);
-        params.host_tcp_port = 55953;
-        snprintf(params.sim_catalog_dir, sizeof(params.sim_catalog_dir), "%s", kCatalogDir);
-        user = sim_backend_create("host", &params);
-        ASSERT_NE(user, nullptr);
-        net_ctx_t *c = nullptr;
-        ASSERT_EQ(net_ctx_create(sim_backend_table(), user, nullptr, &c), DEMO_OK);
-        ctx = c;
-    }
-
-    void Cleanup()
-    {
-        if (ctx)
-            net_ctx_destroy(ctx);
-        if (user)
-            sim_backend_destroy(user);
-        ctx = nullptr;
-        user = nullptr;
-        std::filesystem::remove_all(kCatalogDir);
-    }
-
-    std::string FilePath() const { return std::string(kCatalogDir) + "/pc-hotspot.json"; }
-};
+const char *kCatalogDir = "run/cat_test";
 
 } // namespace
 
-TEST(SimCatalog, PublishSchema2AndDelete)
+TEST(SimCatalog, ReadsFormalFilesSkipsTmpAndInvalid)
 {
     std::filesystem::remove_all(kCatalogDir);
-    CatalogFixture f;
-    f.Init();
-    ASSERT_EQ(net_wifi_ap_start(f.ctx, "Modu_PC", "modu_leventure", nullptr), DEMO_OK);
+    std::string fresh = now_ms_str();
+    /* 正式文件：最新，有效 */
+    write_catalog_file(kCatalogDir, "device-0.json",
+                       record_json("Modu_0001", 0, 21000, "192.168.1.1",
+                                   std::stoll(fresh), getpid()).c_str());
+    /* 临时文件：跳过 */
+    write_catalog_file(kCatalogDir, "device-1.json.tmp-1234",
+                       record_json("Modu_0002", 1, 21001, "192.168.1.1",
+                                   std::stoll(fresh), getpid()).c_str());
+    /* schema 非 1：忽略 */
+    write_catalog_file(kCatalogDir, "device-2.json",
+                       "{\"schema\":2,\"device_index\":2,\"device_id\":\"x\",\"ssid\":\"Modu_0003\","
+                       "\"bssid\":\"x\",\"logical_ip\":\"192.168.1.1\",\"loopback_host\":\"127.0.0.1\","
+                       "\"provision_port\":21002,\"published_at_ms\":1,\"owner_pid\":0}");
+    /* 索引越界文件名：忽略 */
+    write_catalog_file(kCatalogDir, "device-16.json",
+                       record_json("Modu_0004", 16, 21003, "192.168.1.1",
+                                   std::stoll(fresh), getpid()).c_str());
+    /* 非法 IP：忽略 */
+    write_catalog_file(kCatalogDir, "device-3.json",
+                       "{\"schema\":1,\"device_index\":3,\"device_id\":\"x\",\"ssid\":\"Modu_0005\","
+                       "\"bssid\":\"x\",\"logical_ip\":\"999.1.1.1\",\"loopback_host\":\"127.0.0.1\","
+                       "\"provision_port\":21004,\"published_at_ms\":1,\"owner_pid\":0}");
+    /* 损坏 JSON：忽略 */
+    write_catalog_file(kCatalogDir, "device-4.json", "{broken");
+    /* 非契约文件名：忽略 */
+    write_catalog_file(kCatalogDir, "other.json",
+                       record_json("Modu_0006", 0, 21005, "192.168.1.1",
+                                   std::stoll(fresh), getpid()).c_str());
 
-    const std::string path = f.FilePath();
-    ASSERT_TRUE(std::filesystem::exists(path));
-    FILE *file = fopen(path.c_str(), "rb");
-    ASSERT_NE(file, nullptr);
-    fseek(file, 0, SEEK_END);
-    long size = ftell(file);
-    fseek(file, 0, SEEK_SET);
-    std::string text((size_t)size, '\0');
-    ASSERT_EQ(fread(&text[0], 1, text.size(), file), (size_t)size);
-    fclose(file);
-
-    cJSON *root = cJSON_Parse(text.c_str());
-    ASSERT_NE(root, nullptr);
-    EXPECT_EQ(cJSON_GetObjectItemCaseSensitive(root, "schema")->valueint, 2);
-    EXPECT_STREQ(cJSON_GetObjectItemCaseSensitive(root, "ssid")->valuestring, "Modu_PC");
-    EXPECT_STREQ(cJSON_GetObjectItemCaseSensitive(root, "password")->valuestring,
-                 "modu_leventure");
-    EXPECT_STREQ(cJSON_GetObjectItemCaseSensitive(root, "logical_gateway")->valuestring,
-                 "192.168.137.1");
-    EXPECT_EQ(cJSON_GetObjectItemCaseSensitive(root, "prefix_length")->valueint, 24);
-    EXPECT_EQ(cJSON_GetObjectItemCaseSensitive(root, "tcp_port")->valueint, 55953);
-    EXPECT_STREQ(cJSON_GetObjectItemCaseSensitive(root, "loopback_host")->valuestring,
-                 "127.0.0.1");
-    EXPECT_EQ(cJSON_GetObjectItemCaseSensitive(root, "loopback_port")->valueint, 55953);
-    EXPECT_EQ((int)cJSON_GetNumberValue(cJSON_GetObjectItemCaseSensitive(root, "owner_pid")),
-              (int)getpid());
-    cJSON_Delete(root);
-
-    ASSERT_EQ(net_wifi_ap_stop(f.ctx), DEMO_OK);
-    EXPECT_FALSE(std::filesystem::exists(path));
-    f.Cleanup();
+    demo_params_t params;
+    params_defaults(&params);
+    snprintf(params.sim_catalog_dir, sizeof(params.sim_catalog_dir), "%s", kCatalogDir);
+    sim_ap_record_t records[16];
+    int count = sim_backend_ap_list(&params, records, 16);
+    ASSERT_EQ(count, 1);
+    EXPECT_STREQ(records[0].ssid, "Modu_0001");
+    EXPECT_EQ(records[0].real_port, 21000);
+    EXPECT_STREQ(records[0].device_id, "02:00:00:00:00:01");
+    /* 新契约无密码/PIN：PC 使用固定演示凭据 */
+    EXPECT_STREQ(records[0].password, "modutech_leventure");
+    EXPECT_STREQ(records[0].pin, "5935");
+    std::filesystem::remove_all(kCatalogDir);
 }
 
-TEST(SimCatalog, StatusReflectsStartAndStop)
+TEST(SimCatalog, ExpiredWhenOldAndPidDead)
 {
     std::filesystem::remove_all(kCatalogDir);
-    CatalogFixture f;
-    f.Init();
-    net_ap_status_t status;
-    EXPECT_EQ(net_wifi_ap_status(f.ctx, &status), DEMO_ERR); /* 未启动 */
-
-    ASSERT_EQ(net_wifi_ap_start(f.ctx, "Modu_PC", "modu_leventure", nullptr), DEMO_OK);
-    ASSERT_EQ(net_wifi_ap_status(f.ctx, &status), DEMO_OK);
-    EXPECT_EQ(status.started, 1);
-    EXPECT_STREQ(status.ssid, "Modu_PC");
-    EXPECT_STREQ(status.ipv4, "192.168.137.1");
-    EXPECT_EQ(status.prefix_length, 24);
-
-    ASSERT_EQ(net_wifi_ap_stop(f.ctx), DEMO_OK);
-    EXPECT_EQ(net_wifi_ap_status(f.ctx, &status), DEMO_ERR);
-    f.Cleanup();
+    /* 陈旧（published_at_ms=1）且 owner_pid=0 不存在 → 过期忽略 */
+    write_catalog_file(kCatalogDir, "device-0.json",
+                       record_json("Modu_OLD", 0, 21000, "192.168.1.1", 1, 0).c_str());
+    demo_params_t params;
+    params_defaults(&params);
+    snprintf(params.sim_catalog_dir, sizeof(params.sim_catalog_dir), "%s", kCatalogDir);
+    sim_ap_record_t records[16];
+    EXPECT_EQ(sim_backend_ap_list(&params, records, 16), 0);
+    std::filesystem::remove_all(kCatalogDir);
 }
 
-TEST(SimCatalog, ConfigureIpv4UpdatesStatus)
+TEST(SimCatalog, OldButOwnerAliveStillValid)
 {
     std::filesystem::remove_all(kCatalogDir);
-    CatalogFixture f;
-    f.Init();
-    ASSERT_EQ(net_wifi_ap_start(f.ctx, "Modu_PC", "modu_leventure", nullptr), DEMO_OK);
-    ASSERT_EQ(net_wifi_ap_configure_ipv4(f.ctx, "10.0.0.1", 24), DEMO_OK);
-    net_ap_status_t status;
-    ASSERT_EQ(net_wifi_ap_status(f.ctx, &status), DEMO_OK);
-    EXPECT_STREQ(status.ipv4, "10.0.0.1");
-    EXPECT_EQ(status.prefix_length, 24);
-    f.Cleanup();
+    /* 陈旧但 owner_pid=当前进程（存活）→ 仍有效 */
+    write_catalog_file(kCatalogDir, "device-0.json",
+                       record_json("Modu_ALIVE", 0, 21000, "192.168.1.1", 1, getpid()).c_str());
+    demo_params_t params;
+    params_defaults(&params);
+    snprintf(params.sim_catalog_dir, sizeof(params.sim_catalog_dir), "%s", kCatalogDir);
+    sim_ap_record_t records[16];
+    int count = sim_backend_ap_list(&params, records, 16);
+    ASSERT_EQ(count, 1);
+    EXPECT_STREQ(records[0].ssid, "Modu_ALIVE");
+    std::filesystem::remove_all(kCatalogDir);
 }
 
-TEST(SimCatalog, StopDoesNotDeleteForeignOwnedFile)
+TEST(SimCatalog, FindBySsid)
 {
     std::filesystem::remove_all(kCatalogDir);
-    write_file(kCatalogDir, "pc-hotspot.json",
-               "{\"schema\":2,\"ssid\":\"Modu_PC\",\"password\":\"modu_leventure\","
-               "\"logical_gateway\":\"192.168.137.1\",\"prefix_length\":24,"
-               "\"tcp_port\":5935,\"loopback_host\":\"127.0.0.1\",\"loopback_port\":5935,"
-               "\"owner_pid\":99999999,\"published_at_ms\":1}");
-    CatalogFixture f;
-    f.Init();
-    ASSERT_EQ(net_wifi_ap_stop(f.ctx), DEMO_OK); /* 幂等停止 */
-    EXPECT_TRUE(std::filesystem::exists(f.FilePath())); /* owner 非本进程，不删除 */
-    f.Cleanup();
+    std::string fresh = now_ms_str();
+    write_catalog_file(kCatalogDir, "device-5.json",
+                       record_json("Modu_0009", 5, 21009, "192.168.1.1",
+                                   std::stoll(fresh), getpid()).c_str());
+    demo_params_t params;
+    params_defaults(&params);
+    snprintf(params.sim_catalog_dir, sizeof(params.sim_catalog_dir), "%s", kCatalogDir);
+    sim_ap_record_t record;
+    EXPECT_EQ(sim_backend_ap_find(&params, "Modu_0009", &record), DEMO_OK);
+    EXPECT_STREQ(record.ssid, "Modu_0009");
+    EXPECT_EQ(record.real_port, 21009);
+    EXPECT_NE(sim_backend_ap_find(&params, "Modu_MISSING", &record), DEMO_OK);
+    std::filesystem::remove_all(kCatalogDir);
 }
 
-TEST(SimCatalog, StartRejectsInvalidArgs)
+TEST(SimCatalog, MissingDirectoryReturnsEmpty)
 {
     std::filesystem::remove_all(kCatalogDir);
-    CatalogFixture f;
-    f.Init();
-    EXPECT_EQ(net_wifi_ap_start(f.ctx, nullptr, "modu_leventure", nullptr), DEMO_ERR_INVAL);
-    EXPECT_EQ(net_wifi_ap_start(f.ctx, "Modu_PC", nullptr, nullptr), DEMO_ERR_INVAL);
-    EXPECT_FALSE(std::filesystem::exists(f.FilePath()));
-    f.Cleanup();
+    demo_params_t params;
+    params_defaults(&params);
+    snprintf(params.sim_catalog_dir, sizeof(params.sim_catalog_dir), "%s", kCatalogDir);
+    sim_ap_record_t records[16];
+    EXPECT_EQ(sim_backend_ap_list(&params, records, 16), 0);
 }

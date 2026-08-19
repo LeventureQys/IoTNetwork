@@ -1,81 +1,103 @@
 {
+  "schema": 1,
   "actions": [
     {
+      "id": "g_prov",
+      "target": "pc",
+      "after_event": "ready",
+      "delay_ms": 2500,
+      "action": "auto_provision",
+      "args": {
+        "ssid": "TactileFactory-2.4G",
+        "password": "securepass123"
+      }
+    },
+    {
       "id": "g_pc_512",
+      "target": "pc",
       "after_event": "session_online",
       "delay_ms": 1500,
+      "action": "send_app_data",
       "args": {
         "text": "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP"
-      },
-      "target": "pc",
-      "action": "send_app_data"
+      }
     },
     {
       "id": "g_dev_512",
+      "target": "device",
       "after_event": "session_online",
       "delay_ms": 2500,
+      "action": "send_app_data",
       "args": {
         "text": "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
-      },
-      "target": "device",
-      "action": "send_app_data"
+      }
     },
     {
       "id": "g_pc_513",
+      "target": "pc",
       "after_event": "session_online",
       "delay_ms": 3500,
+      "action": "send_app_data",
       "args": {
         "text": "QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ"
-      },
-      "target": "pc",
-      "action": "send_app_data"
+      }
     },
     {
       "id": "g_dev_513",
+      "target": "device",
       "after_event": "session_online",
       "delay_ms": 4500,
+      "action": "send_app_data",
       "args": {
         "text": "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
-      },
-      "target": "device",
-      "action": "send_app_data"
+      }
     },
     {
       "id": "g_pc_utf8",
+      "target": "pc",
       "after_event": "session_online",
       "delay_ms": 5500,
+      "action": "send_app_data",
       "args": {
         "text": "模组科技网络双向数据一致性测试-UTF8多字节-0123456789-中文编码验证-abcdefghijklmnopqrstuvwxyz"
-      },
-      "target": "pc",
-      "action": "send_app_data"
+      }
     },
     {
       "id": "g_dev_utf8",
+      "target": "device",
       "after_event": "session_online",
       "delay_ms": 6500,
+      "action": "send_app_data",
       "args": {
         "text": "设备端UTF8回传：压强传感数据帧边界测试-协议互操作-2026-双向发送"
-      },
-      "target": "device",
-      "action": "send_app_data"
+      }
     },
     {
-      "id": "g_pc_stop",
+      "id": "g_stop",
+      "target": "pc",
       "after_event": "session_online",
       "delay_ms": 10000,
-      "args": {},
-      "target": "pc",
-      "action": "request_stop"
+      "action": "request_stop",
+      "args": {}
     },
     {
       "id": "g_dev_stop",
+      "target": "device",
       "after_event": "session_offline",
       "delay_ms": 1000,
-      "args": {},
-      "target": "device",
-      "action": "request_stop"
+      "action": "request_stop",
+      "args": {}
+    },
+    {
+      "id": "g_prov_retry",
+      "target": "pc",
+      "after_event": "ready",
+      "delay_ms": 5000,
+      "action": "auto_provision",
+      "args": {
+        "ssid": "TactileFactory-2.4G",
+        "password": "securepass123"
+      }
     }
-  ],
-  "schema": 1
+  ]
 }
