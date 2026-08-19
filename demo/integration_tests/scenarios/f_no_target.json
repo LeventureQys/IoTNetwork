@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "actions": [
+    {
+      "id": "f_dev_stop",
+      "target": "device",
+      "after_event": "ready",
+      "delay_ms": 15000,
+      "action": "request_stop",
+      "args": {}
+    }
+  ]
+}

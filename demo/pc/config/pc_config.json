@@ -1,0 +1,13 @@
+{
+  "host_tcp_port": 5935,
+  "pc_ap_ssid": "Modu_PC",
+  "pc_ap_password": "modu_leventure",
+  "pc_ap_ip": "192.168.137.1",
+  "pc_ap_prefix_length": 24,
+  "heartbeat_interval_ms": 2000,
+  "heartbeat_dead_ms": 0,
+  "hello_timeout_ms": 5000,
+  "malformed_max_per_conn": 3,
+  "device_rate_limit_per_sec": 50,
+  "duration_s": 45
+}

@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "actions": [
+    {
+      "id": "c_pc_stop",
+      "target": "pc",
+      "after_event": "session_online",
+      "delay_ms": 3000,
+      "action": "request_stop",
+      "args": {}
+    },
+    {
+      "id": "c_dev_stop",
+      "target": "device",
+      "after_event": "session_offline",
+      "delay_ms": 1000,
+      "action": "request_stop",
+      "args": {}
+    }
+  ]
+}

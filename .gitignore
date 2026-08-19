@@ -1,0 +1,80 @@
+# ============================================================
+# ModuTech_IoTNetwork .gitignore
+# ============================================================
+
+# ---------- CMake / 编译产物 ----------
+demo/build/
+demo/build_split/
+demo/build-tests/
+demo/build_test/
+demo/pc/build*/
+demo/device/build*/
+demo/tests/build*/
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+CMakeUserPresets.json
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+*.suo
+*.user
+*.tlog
+*.obj
+*.o
+*.a
+*.lib
+*.exe
+*.dll
+*.so
+*.dylib
+*.ilk
+*.exp
+*.pdb
+*.idb
+
+# ---------- IDE / 编辑器 ----------
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ---------- 工具 / 静态分析产物 ----------
+compile_commands.json
+.clangd/
+.cache/
+
+# ---------- 运行时产物（运行日志 / 模拟 NVS / 候选列表 / 脚本中间产物） ----------
+demo/run/
+demo/logs/
+run/
+*.nvs.json
+out/
+**/tests/run/
+*.jsonl
+*.log
+
+# ---------- 系统 / 临时文件 ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+*.tmp
+*.bak
+*.orig
+*.rej
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# ---------- 文档生成产物（由 scripts/ 重新生成，不入库） ----------
+/ESP32-C2配网与连接保障流程.docx

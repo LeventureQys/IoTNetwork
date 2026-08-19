@@ -1,0 +1,4 @@
+# 组件依赖（ESP-IDF 组件管理器）
+dependencies:
+  idf: ">=5.0"
+  mdns: "*"

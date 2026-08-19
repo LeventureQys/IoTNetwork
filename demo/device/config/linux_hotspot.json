@@ -1,0 +1,14 @@
+{
+  "enable": true,
+  "sta_interface": "wlP2p33s0",
+  "ap_interface": "ap0",
+  "subnet": "10.42.0.1",
+  "prefix_length": 24,
+  "dhcp_start": "10.42.0.100",
+  "dhcp_end": "10.42.0.200",
+  "channel": 0,
+  "nat": false,
+  "hostapd_bin": "hostapd",
+  "dnsmasq_bin": "dnsmasq",
+  "work_dir": "/tmp"
+}

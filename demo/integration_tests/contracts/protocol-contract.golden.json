@@ -1,0 +1,41 @@
+{
+  "schema_version": 2,
+  "generated_from": "demo/include/protocol.h",
+  "protocol_version": 1,
+  "frame": {
+    "prefix_bytes": 2,
+    "byte_order": "big",
+    "max_payload": 1024
+  },
+  "tcp": {
+    "host_ip": "192.168.137.1",
+    "port": 5935,
+    "max_connections": 1
+  },
+  "wifi": {
+    "ssid_prefix": "Modu_",
+    "default_ssid": "Modu_PC",
+    "password": "modu_leventure",
+    "prefix_length": 24
+  },
+  "limits": {
+    "app_data_text_bytes": 512,
+    "session_id_length": 8
+  },
+  "commands": [
+    "device_hello",
+    "host_ack",
+    "ping",
+    "pong",
+    "app_data"
+  ],
+  "device_states": {
+    "boot": 0,
+    "wifi_scan": 1,
+    "sta_join": 2,
+    "connect": 3,
+    "session": 4,
+    "heal": 5,
+    "count": 6
+  }
+}

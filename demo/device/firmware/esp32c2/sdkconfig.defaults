@@ -1,0 +1,9 @@
+# ESP32-C2 骨架工程默认配置（idf.py set-target esp32c2 之后生效）
+CONFIG_IDF_TARGET="esp32c2"
+CONFIG_ESPTOOLPY_FLASHSIZE_2MB=y
+
+# 日志：骨架阶段使用默认级别即可
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# mDNS（设备发现通告使用；IDF 组件管理器自动拉取 esp-mdns）
+CONFIG_MDNS_MAX_SERVICES=2

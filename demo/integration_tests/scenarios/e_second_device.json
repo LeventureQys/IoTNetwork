@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "actions": [
+    {
+      "id": "e_pc_stop",
+      "target": "pc",
+      "after_event": "session_online",
+      "delay_ms": 8000,
+      "action": "request_stop",
+      "args": {}
+    },
+    {
+      "id": "e_dev1_stop",
+      "target": "device",
+      "after_event": "session_offline",
+      "delay_ms": 1000,
+      "action": "request_stop",
+      "args": {}
+    },
+    {
+      "id": "e_dev2_stop",
+      "target": "device",
+      "after_event": "session_offline",
+      "delay_ms": 1000,
+      "action": "request_stop",
+      "args": {}
+    }
+  ]
+}
