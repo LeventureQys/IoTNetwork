@@ -15,8 +15,9 @@
 
 ## JSONL 事件
 
-两端以 `--events-jsonl <path>` 输出，事件字段契约见 `Document/Update/beta v1.0.5 - 代码完全拆分/设计文档.md` 第 11 节。
+两端以 `--events-jsonl <path>` 输出，事件字段契约见 `Document/Update/beta v1.1/设计文档.md` 第 11 节。
 
 ## 场景
 
-场景 JSON 以 `--scenario <path>` 传入；只允许 sim 后端。schema 和 action 定义见设计文档第 11 节。
+场景 JSON 以 `--scenario <path>` 传入；只允许 sim 后端。schema 和 action 定义见
+`Document/Update/beta v1.1/设计文档.md` 第 11 节。
