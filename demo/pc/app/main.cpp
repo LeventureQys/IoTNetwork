@@ -351,6 +351,8 @@ int main(int argc, char **argv)
     snprintf(events_path, sizeof(events_path), "%s", cli_events);
     snprintf(scenario_path, sizeof(scenario_path), "%s",
              cli_scenario[0] ? cli_scenario : cfg_scenario);
+    /* 串口数据面与诊断日志同目录；HostWindow 经 params 读取落盘目录 */
+    snprintf(params.log_dir, sizeof(params.log_dir), "%s", log_dir);
 
     if (opts.duration > 0)
         params.duration_s = opts.duration;
@@ -479,6 +481,8 @@ int main(int argc, char **argv)
     {
         QApplication app(argc, argv);
         HostWindow window(host);
+        /* 窗口创建后接线数据面；窗口析构时 HostWindow 会先反注册再释放模型 */
+        host->SetDataSink(window.serial_model());
         if (params.duration_s > 0)
             QTimer::singleShot(params.duration_s * 1000, &window, &QWidget::close);
         QObject::connect(&window, &HostWindow::StopRequested, [&]() {

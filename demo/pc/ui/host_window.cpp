@@ -2,6 +2,7 @@
 #include "host_app.h"
 #include "log_model.h"
 #include "handshake_flow_widget.h"
+#include "serial_data_model.h"
 #include "log.h"
 
 #include <QCloseEvent>
@@ -43,6 +44,13 @@ HostWindow::HostWindow(HostApp *host, QWidget *parent)
     g_host_flow_widget = flow_widget_;
     log_set_sink(HostLogSink);
 
+    serial_model_ = new SerialDataModel(this);
+    {
+        const std::string serial_log_dir = host_->params().log_dir;
+        if (!serial_log_dir.empty())
+            serial_model_->SetLogDirectory(serial_log_dir);
+    }
+
     const QString ssid = QString::fromUtf8(host_->params().pc_ap_ssid);
     const QString ip = QString::fromUtf8(host_->params().pc_ap_ip);
     hotspot_status_ = new QLabel(
@@ -54,6 +62,9 @@ HostWindow::HostWindow(HostApp *host, QWidget *parent)
     hotspot_status_->setStyleSheet("QLabel { font-weight: bold; color: #0f172a; }");
 
     summary_ = new QLabel(QStringLiteral("尚无设备注册"), this);
+    serial_stats_ = new QLabel(
+        QStringLiteral("串口数据：等待设备 SERIAL_BYTES 会话"), this);
+    serial_stats_->setStyleSheet("QLabel { color: #334155; }");
     device_table_ = new QTableWidget(this);
     device_table_->setColumnCount(7);
     device_table_->setHorizontalHeaderLabels({QStringLiteral("设备 ID"), QStringLiteral("状态"),
@@ -89,6 +100,7 @@ HostWindow::HostWindow(HostApp *host, QWidget *parent)
     QVBoxLayout *layout = new QVBoxLayout;
     layout->addWidget(hotspot_status_);
     layout->addWidget(summary_);
+    layout->addWidget(serial_stats_);
     layout->addWidget(flow_widget_);
     layout->addWidget(splitter, 1);
     layout->addLayout(buttons);
@@ -102,8 +114,17 @@ HostWindow::HostWindow(HostApp *host, QWidget *parent)
     LOG_I("MAIN", "上位机界面已就绪");
 }
 
+IHostDataSink *HostWindow::serial_model() const
+{
+    return serial_model_;
+}
+
 HostWindow::~HostWindow()
 {
+    /* 先反注册数据面 sink，再释放 SerialDataModel，避免 host 线程回调悬空指针 */
+    host_->SetDataSink(nullptr);
+    delete serial_model_;
+    serial_model_ = nullptr;
     log_set_sink(nullptr);
     g_host_log_model = nullptr;
     g_host_flow_widget = nullptr;
@@ -113,6 +134,8 @@ void HostWindow::Refresh()
 {
     log_model_->Drain();
     flow_widget_->DrainEvents();
+    serial_model_->Drain();
+    serial_stats_->setText(serial_model_->DisplayText());
     log_view_->scrollToBottom();
     const auto entries = host_->registry().Snapshot();
     summary_->setText(QStringLiteral("已注册 %1 台设备，在线 %2 台")

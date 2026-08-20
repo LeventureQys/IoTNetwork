@@ -4,8 +4,10 @@
 #include <QMainWindow>
 
 class HostApp;
+class IHostDataSink;
 class HandshakeFlowWidget;
 class LogModel;
+class SerialDataModel;
 class QListView;
 class QLabel;
 class QPushButton;
@@ -17,6 +19,9 @@ class HostWindow : public QMainWindow {
 public:
     explicit HostWindow(HostApp *host, QWidget *parent = nullptr);
     ~HostWindow() override;
+
+    /* main 在窗口创建后经此访问器把 SerialDataModel 接到 HostApp */
+    IHostDataSink *serial_model() const;
 
 signals:
     void StopRequested();
@@ -35,6 +40,8 @@ private:
     QListView *log_view_;
     QLabel *summary_;
     QLabel *hotspot_status_;
+    SerialDataModel *serial_model_;
+    QLabel *serial_stats_;
     QTableWidget *device_table_;
     QLineEdit *msg_edit_;
     QPushButton *msg_send_button_;

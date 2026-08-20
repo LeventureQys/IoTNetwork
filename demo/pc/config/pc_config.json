@@ -9,5 +9,5 @@
   "hello_timeout_ms": 5000,
   "malformed_max_per_conn": 3,
   "device_rate_limit_per_sec": 50,
-  "duration_s": 45
+  "duration_s": 0
 }

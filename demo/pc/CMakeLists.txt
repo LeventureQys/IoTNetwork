@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(ModuTechPc VERSION 1.0.5 LANGUAGES C CXX)
+project(ModuTechPc VERSION 1.0.6 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -119,6 +119,7 @@ add_library(pc_ui STATIC
     ui/host_window.cpp
     ui/components/log_model.cpp
     ui/components/handshake_flow_widget.cpp
+    ui/components/serial_data_model.cpp
 )
 set_target_properties(pc_ui PROPERTIES AUTOMOC ON)
 target_include_directories(pc_ui PUBLIC

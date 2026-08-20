@@ -367,7 +367,7 @@ static int fb_sock_recv(void *user, void *sock, uint8_t *buf, int cap)
         const char *json = g.ack_busy
             ? "{\"cmd\":\"host_ack\",\"status\":\"busy\",\"reason\":\"single_device_only\"}"
             : "{\"cmd\":\"host_ack\",\"status\":\"ok\",\"heartbeat_interval\":1,"
-              "\"session_id\":\"deadbeef\",\"proto_ver\":1}";
+              "\"session_id\":\"deadbeef\",\"proto_ver\":2}";
         uint8_t frame[512];
         int flen = frame_v2_wrap(PROTO_V2_TYPE_CONTROL_JSON, 1,
                                   (const uint8_t *)json, (int)strlen(json),

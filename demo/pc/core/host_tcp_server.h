@@ -22,7 +22,13 @@ public:
     HostTcpServer(net_ctx_t *net, HostRegistry &reg, const demo_params_t &params,
                   IHostDataSink *sink = nullptr);
     ~HostTcpServer();
-    void SetDataSink(IHostDataSink *sink) { sink_ = sink; }
+    /* UI/主线程调用；sink_mu_ 保证 SetDataSink(nullptr) 返回后不再有回调
+     * 正在使用旧 sink，窗口析构时释放 SerialDataModel 是安全的。 */
+    void SetDataSink(IHostDataSink *sink)
+    {
+        std::lock_guard<std::mutex> lock(sink_mu_);
+        sink_ = sink;
+    }
     int Start(); /* 幂等：已有 listener 时返回 DEMO_OK */
     void Stop(); /* 幂等：关闭 pending/online 连接与 listener；可重复调用 */
     bool Started() const { return listen_ != nullptr; }
@@ -62,6 +68,7 @@ private:
     HostRegistry &reg_;
     const demo_params_t &params_;
     IHostDataSink *sink_ = nullptr;
+    std::mutex sink_mu_;
     void *listen_ = nullptr;
     std::vector<PendingConn> pending_;
     std::map<void *, std::vector<uint8_t>> conn_rx_; /* 已注册连接收包缓冲（按句柄隔离） */

@@ -515,8 +515,11 @@ void HostTcpServer::HandlePending(PendingConn &pc, uint64_t now_ms)
                   resumed ? "（已恢复）" : "");
             e->conn = pc.sock; /* 从 pending 转入 registry */
             pc.sock = nullptr;
-            if (sink_)
-                sink_->OnSessionOnline(id->valuestring, e->session_id, profile);
+            {
+                std::lock_guard<std::mutex> sink_lock(sink_mu_);
+                if (sink_)
+                    sink_->OnSessionOnline(id->valuestring, e->session_id, profile);
+            }
             {
                 char data[128];
                 snprintf(data, sizeof(data), "{\"peer\":\"%s\",\"reconnect_count\":%d}",
@@ -553,8 +556,11 @@ void HostTcpServer::HandleOnline(DeviceEntry &e, uint64_t now_ms)
         send_ctx_.erase(e.conn);
         e.conn = nullptr;
         reg_.MarkOffline(e.id);
-        if (sink_)
-            sink_->OnSessionOffline(e.id, e.session_id, "conn_lost");
+        {
+            std::lock_guard<std::mutex> sink_lock(sink_mu_);
+            if (sink_)
+                sink_->OnSessionOffline(e.id, e.session_id, "conn_lost");
+        }
         pc_event_t ev;
         memset(&ev, 0, sizeof(ev));
         ev.event = "session_offline";
@@ -579,9 +585,12 @@ void HostTcpServer::HandleOnline(DeviceEntry &e, uint64_t now_ms)
         }
         reg_.OnRx(e.id, now_ms);
         if (frame.type == PROTO_V2_TYPE_SERIAL_BYTES) {
-            if (sink_)
-                sink_->OnSerialBytes(e.id, e.session_id, frame.payload.data(),
-                                     frame.payload.size(), now_ms);
+            {
+                std::lock_guard<std::mutex> sink_lock(sink_mu_);
+                if (sink_)
+                    sink_->OnSerialBytes(e.id, e.session_id, frame.payload.data(),
+                                         frame.payload.size(), now_ms);
+            }
             continue;
         }
         cJSON *json = cJSON_ParseWithLength((const char *)frame.payload.data(),

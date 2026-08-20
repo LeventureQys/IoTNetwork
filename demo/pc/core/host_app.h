@@ -7,6 +7,7 @@
 #include "net_abstraction.h"
 #include "params.h"
 #include "host_registry.h"
+#include "host_data_sink.h"
 #include "host_tcp_server.h"
 
 /* beta v1.1：一对一 PC 热点直连生命周期（设计文档 8.1）。
@@ -22,6 +23,8 @@ public:
     void ForceCrash();        /* 剧本 host_crash：直接关闭，不广播 */
     /* UI 线程调用：向指定设备入队一条联调消息（app_data），由主循环冲刷发送 */
     int SendAppDataToDevice(const std::string &id, const std::string &text);
+    /* 数据面 sink 透传：HostTcpServer 内部已有空指针保护与回调线程同步 */
+    void SetDataSink(IHostDataSink *sink) { tcp_server_.SetDataSink(sink); }
     size_t OnlineCount() const;
     const demo_params_t &params() const { return params_; }
     HostRegistry &registry_mut() { return registry_; }

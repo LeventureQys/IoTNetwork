@@ -6,6 +6,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <iphlpapi.h>
+#include <ipifcons.h>
 
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -30,6 +31,7 @@ namespace {
 
 struct RealImpl {
     NetworkOperatorTetheringManager manager{nullptr};
+    NET_IFINDEX source_ifindex = 0;
     bool started = false;
     std::string ssid;
 };
@@ -76,10 +78,14 @@ ConnectionProfile find_wifi_profile()
     return nullptr;
 }
 
-/* 定位 Windows 移动热点承载适配器（Microsoft Wi-Fi Direct Virtual Adapter 或
- * 持有 192.168.137.x 的适配器），仅读取 IPv4/前缀，绝不修改其他网卡。
- * 优先级：已持有 192.168.137.x 的 Up 适配器 > Up 的 Wi-Fi Direct 虚拟适配器（非 APIPA）
- * > Up 的 Wi-Fi Direct 虚拟适配器（任意地址）。后者用于 ICS 尚未完成地址分配时的暂态。 */
+/* 定位 Windows 移动热点承载适配器。
+ * 现代移动热点在启动后由 ICS 异步创建 Microsoft Wi-Fi Direct Virtual Adapter，
+ * 其创建和 IPv4 分配均可能晚于 TetheringOperationalState=On；描述名还会随系统语言变化。
+ * 识别优先级：
+ *   1. 持有 192.168.137.x 的 Up 适配器（ICS 已收敛）
+ *   2. 描述名包含 Wi-Fi Direct / Virtual Adapter / 虚拟适配器的 Up 适配器（本地化兜底）
+ *   3. 非源网卡的 Up Wi-Fi 适配器（源网卡在 Start 时记录并排除）
+ * 调用方在热点刚启动后应轮询本函数，等待承载适配器与 IPv4 出现。 */
 struct HotspotAdapterInfo {
     bool found = false;
     NET_IFINDEX ifindex = 0;
@@ -87,13 +93,43 @@ struct HotspotAdapterInfo {
     int prefix = 0;
 };
 
-HotspotAdapterInfo query_hotspot_adapter()
+bool has_hosted_adapter_description(const wchar_t *description)
+{
+    if (!description)
+        return false;
+    return wcsstr(description, L"Wi-Fi Direct") != nullptr ||
+           wcsstr(description, L"Direct Virtual Adapter") != nullptr ||
+           wcsstr(description, L"Virtual Adapter") != nullptr ||
+           wcsstr(description, L"虚拟适配器") != nullptr;
+}
+
+bool interface_index_from_connection_profile(const ConnectionProfile &profile,
+                                             NET_IFINDEX *out_index)
+{
+    if (!profile || !out_index)
+        return false;
+    const NetworkAdapter adapter = profile.NetworkAdapter();
+    if (adapter == nullptr)
+        return false;
+    const winrt::guid adapter_id = adapter.NetworkAdapterId();
+    GUID guid{};
+    std::memcpy(&guid, &adapter_id, sizeof(guid));
+    NET_LUID luid{};
+    return ConvertInterfaceGuidToLuid(&guid, &luid) == NO_ERROR &&
+           ConvertInterfaceLuidToIndex(&luid, out_index) == NO_ERROR;
+}
+
+HotspotAdapterInfo query_hotspot_adapter(NET_IFINDEX source_ifindex)
 {
     HotspotAdapterInfo info;
-    HotspotAdapterInfo virtual_ok;  /* 虚拟适配器，非 APIPA 地址 */
-    HotspotAdapterInfo virtual_any; /* 虚拟适配器，任意 IPv4（含 APIPA 暂态） */
-    bool have_virtual_ok = false;
-    bool have_virtual_any = false;
+    HotspotAdapterInfo described_ok;  /* 描述名匹配的承载适配器，非 APIPA */
+    HotspotAdapterInfo described_any; /* 描述名匹配的承载适配器，任意 IPv4 */
+    HotspotAdapterInfo wifi_ok;       /* 非源 Wi-Fi 适配器，非 APIPA */
+    HotspotAdapterInfo wifi_any;      /* 非源 Wi-Fi 适配器，任意 IPv4 */
+    bool have_described_ok = false;
+    bool have_described_any = false;
+    bool have_wifi_ok = false;
+    bool have_wifi_any = false;
     const ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
                         GAA_FLAG_SKIP_DNS_SERVER;
     ULONG size = 0;
@@ -106,9 +142,19 @@ HotspotAdapterInfo query_hotspot_adapter()
     for (auto *adapter = adapters; adapter; adapter = adapter->Next) {
         if (adapter->OperStatus != IfOperStatusUp)
             continue;
-        const bool is_virtual =
-            adapter->Description != nullptr &&
-            wcsstr(adapter->Description, L"Wi-Fi Direct Virtual Adapter") != nullptr;
+        /* 源网卡（对外上网网卡）绝不能被当作热点承载适配器改写；
+         * 但若源 profile 本身就是 Wi-Fi Direct 虚拟适配器（例如热点已由系统开启），
+         * 仍按描述名识别为承载适配器。 */
+        const bool description_match =
+            has_hosted_adapter_description(adapter->Description);
+        if (source_ifindex != 0 && adapter->IfIndex == source_ifindex &&
+            !description_match)
+            continue;
+        const bool wifi_interface = adapter->IfType == IF_TYPE_IEEE80211;
+        const bool candidate = description_match ||
+            (source_ifindex != 0 && wifi_interface);
+        if (!candidate)
+            continue;
         for (auto *address = adapter->FirstUnicastAddress; address; address = address->Next) {
             if (!address->Address.lpSockaddr ||
                 address->Address.lpSockaddr->sa_family != AF_INET)
@@ -126,27 +172,50 @@ HotspotAdapterInfo query_hotspot_adapter()
                 info.prefix = (int)address->OnLinkPrefixLength;
                 return info;
             }
-            if (!is_virtual)
-                continue;
             const bool apipa = strncmp(buffer, "169.254.", 8) == 0;
-            if (!apipa && !have_virtual_ok) {
-                virtual_ok.found = true;
-                virtual_ok.ifindex = adapter->IfIndex;
-                virtual_ok.ipv4 = buffer;
-                virtual_ok.prefix = (int)address->OnLinkPrefixLength;
-                have_virtual_ok = true;
-            } else if (apipa && !have_virtual_any) {
-                virtual_any.found = true;
-                virtual_any.ifindex = adapter->IfIndex;
-                virtual_any.ipv4 = buffer;
-                virtual_any.prefix = (int)address->OnLinkPrefixLength;
-                have_virtual_any = true;
+            HotspotAdapterInfo *slot = nullptr;
+            bool *have_slot = nullptr;
+            if (description_match) {
+                slot = apipa ? &described_any : &described_ok;
+                have_slot = apipa ? &have_described_any : &have_described_ok;
+            } else {
+                slot = apipa ? &wifi_any : &wifi_ok;
+                have_slot = apipa ? &have_wifi_any : &have_wifi_ok;
+            }
+            if (slot && have_slot && !*have_slot) {
+                slot->found = true;
+                slot->ifindex = adapter->IfIndex;
+                slot->ipv4 = buffer;
+                slot->prefix = (int)address->OnLinkPrefixLength;
+                *have_slot = true;
             }
         }
     }
-    if (have_virtual_ok)
-        return virtual_ok;
-    return virtual_any;
+    if (have_described_ok)
+        return described_ok;
+    if (have_described_any)
+        return described_any;
+    if (have_wifi_ok)
+        return wifi_ok;
+    return wifi_any;
+}
+
+/* 热点启动后承载适配器与 IPv4 异步出现：250ms * (attempts-1) 轮询窗口。 */
+constexpr int kHotspotAdapterWaitAttempts = 40; /* 约 10 秒 */
+
+HotspotAdapterInfo wait_for_hotspot_adapter(NET_IFINDEX source_ifindex, int attempts)
+{
+    HotspotAdapterInfo info;
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        info = query_hotspot_adapter(source_ifindex);
+        if (info.found && !info.ipv4.empty())
+            return info;
+        if (attempt == 0)
+            LOG_I("HOTSPOT", "等待热点承载适配器 IPv4 就绪（最多 10 秒）");
+        if (attempt + 1 < attempts)
+            Sleep(250);
+    }
+    return info;
 }
 
 bool valid_ipv4_text(const char *ipv4)
@@ -215,6 +284,10 @@ int real_start(void *ctx, const char *ssid, const char *password, std::string *e
             if (error) *error = "未找到可承载热点的 WiFi 网卡";
             return DEMO_ERR;
         }
+
+        impl->source_ifindex = 0;
+        if (!interface_index_from_connection_profile(profile, &impl->source_ifindex))
+            LOG_W("HOTSPOT", "无法解析热点源网卡索引，承载适配器将退化为描述名匹配");
         TetheringCapability capability =
             NetworkOperatorTetheringManager::GetTetheringCapabilityFromConnectionProfile(profile);
         if (capability != TetheringCapability::Enabled) {
@@ -301,9 +374,10 @@ int real_query(void *ctx, net_ap_status_t *status, std::string *error)
             impl->manager.GetCurrentAccessPointConfiguration();
         const std::string ssid = to_string(config.Ssid());
         snprintf(status->ssid, sizeof(status->ssid), "%s", ssid.c_str());
-        HotspotAdapterInfo info = query_hotspot_adapter();
+        HotspotAdapterInfo info = wait_for_hotspot_adapter(
+            impl->source_ifindex, kHotspotAdapterWaitAttempts);
         if (!info.found) {
-            if (error) *error = "未找到热点承载适配器的 IPv4";
+            if (error) *error = "热点已开启，但 10 秒内未找到承载适配器的 IPv4";
             return DEMO_ERR;
         }
         snprintf(status->ipv4, sizeof(status->ipv4), "%s", info.ipv4.c_str());
@@ -335,9 +409,10 @@ int real_configure_ipv4(void *ctx, const char *ipv4, int prefix_length, std::str
         if (error) *error = "热点未运行";
         return DEMO_ERR;
     }
-    HotspotAdapterInfo info = query_hotspot_adapter();
+    HotspotAdapterInfo info = wait_for_hotspot_adapter(
+        impl->source_ifindex, kHotspotAdapterWaitAttempts);
     if (!info.found) {
-        if (error) *error = "未找到热点承载适配器，无法限定 IP 配置范围";
+        if (error) *error = "10 秒内未找到热点承载适配器，无法限定 IP 配置范围";
         return DEMO_ERR;
     }
     if (info.ipv4 == ipv4 && info.prefix == prefix_length) {
@@ -350,7 +425,7 @@ int real_configure_ipv4(void *ctx, const char *ipv4, int prefix_length, std::str
     if (info.ipv4.rfind("169.254.", 0) == 0) {
         for (int attempt = 0; attempt < 24; ++attempt) { /* 24 * 500ms = 12 秒 */
             Sleep(500);
-            HotspotAdapterInfo latest = query_hotspot_adapter();
+            HotspotAdapterInfo latest = query_hotspot_adapter(impl->source_ifindex);
             if (latest.found) {
                 if (latest.ipv4 == ipv4 && latest.prefix == prefix_length) {
                     LOG_I("HOTSPOT", "ICS 已将热点承载适配器配置为目标值 %s/%d",
