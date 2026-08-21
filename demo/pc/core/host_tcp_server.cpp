@@ -545,109 +545,115 @@ void HostTcpServer::HandlePending(PendingConn &pc, uint64_t now_ms)
 
 void HostTcpServer::HandleOnline(DeviceEntry &e, uint64_t now_ms)
 {
-    uint8_t buf[512];
-    int n = net_sock_recv(net_, e.conn, buf, (int)sizeof(buf));
-    if (n == DEMO_ERR_AGAIN)
-        return;
-    if (n <= 0) {
-        LOG_W("HOST", "设备连接已断开：%s（接收返回=%d）", e.id.c_str(), n);
-        net_sock_close(net_, e.conn);
-        conn_rx_.erase(e.conn);
-        send_ctx_.erase(e.conn);
-        e.conn = nullptr;
-        reg_.MarkOffline(e.id);
-        {
-            std::lock_guard<std::mutex> sink_lock(sink_mu_);
-            if (sink_)
-                sink_->OnSessionOffline(e.id, e.session_id, "conn_lost");
-        }
-        pc_event_t ev;
-        memset(&ev, 0, sizeof(ev));
-        ev.event = "session_offline";
-        ev.result = "ok";
-        ev.code = DEMO_OK;
-        ev.device_id = e.id.c_str();
-        ev.data_json = "{\"reason\":\"conn_lost\"}";
-        pc_events_emit(&ev);
-        return;
-    }
-    LOG_D("HOST", "从在线设备 %s 收到 %d 字节", e.id.c_str(), n);
-    std::vector<uint8_t> &rx = conn_rx_[e.conn];
-    rx.insert(rx.end(), buf, buf + n);
-    while (!rx.empty()) {
-        ParsedFrame frame;
-        int rc = parse_v2_frames(rx, &frame);
-        if (rc == 0)
-            break;
-        if (rc < 0) {
-            LOG_W("HOST", "在线连接收到畸形帧，已丢弃");
-            continue;
-        }
-        reg_.OnRx(e.id, now_ms);
-        if (frame.type == PROTO_V2_TYPE_SERIAL_BYTES) {
+    static constexpr size_t kReceiveBudget = 256 * 1024;
+    uint8_t buf[4096];
+    size_t received = 0;
+
+    while (received < kReceiveBudget) {
+        int n = net_sock_recv(net_, e.conn, buf, (int)sizeof(buf));
+        if (n == DEMO_ERR_AGAIN)
+            return;
+        if (n <= 0) {
+            LOG_W("HOST", "设备连接已断开：%s（接收返回=%d）", e.id.c_str(), n);
+            net_sock_close(net_, e.conn);
+            conn_rx_.erase(e.conn);
+            send_ctx_.erase(e.conn);
+            e.conn = nullptr;
+            reg_.MarkOffline(e.id);
             {
                 std::lock_guard<std::mutex> sink_lock(sink_mu_);
                 if (sink_)
-                    sink_->OnSerialBytes(e.id, e.session_id, frame.payload.data(),
-                                         frame.payload.size(), now_ms);
+                    sink_->OnSessionOffline(e.id, e.session_id, "conn_lost");
             }
-            continue;
+            pc_event_t ev;
+            memset(&ev, 0, sizeof(ev));
+            ev.event = "session_offline";
+            ev.result = "ok";
+            ev.code = DEMO_OK;
+            ev.device_id = e.id.c_str();
+            ev.data_json = "{\"reason\":\"conn_lost\"}";
+            pc_events_emit(&ev);
+            return;
         }
-        cJSON *json = cJSON_ParseWithLength((const char *)frame.payload.data(),
-                                            frame.payload.size());
-        if (json == nullptr) {
-            LOG_W("HOST", "在线控制帧 JSON 解析失败");
-            continue;
-        }
-        const cJSON *cmd = cJSON_GetObjectItemCaseSensitive(json, "cmd");
-        const char *name = cmd && cJSON_IsString(cmd) ? cmd->valuestring : nullptr;
-        if (name && strcmp(name, CMD_PING) == 0) {
-            const cJSON *seq = cJSON_GetObjectItemCaseSensitive(json, "seq");
-            if (cJSON_IsNumber(seq)) {
-                reg_.OnPing(e.id, (uint32_t)seq->valueint);
+        received += (size_t)n;
+        LOG_D("HOST", "从在线设备 %s 收到 %d 字节", e.id.c_str(), n);
+        std::vector<uint8_t> &rx = conn_rx_[e.conn];
+        rx.insert(rx.end(), buf, buf + n);
+        while (!rx.empty()) {
+            ParsedFrame frame;
+            int rc = parse_v2_frames(rx, &frame);
+            if (rc == 0)
+                break;
+            if (rc < 0) {
+                LOG_W("HOST", "在线连接收到畸形帧，已丢弃");
+                continue;
+            }
+            reg_.OnRx(e.id, now_ms);
+            if (frame.type == PROTO_V2_TYPE_SERIAL_BYTES) {
                 {
-                    char data[96];
-                    snprintf(data, sizeof(data), "{\"direction\":\"rx\",\"sequence\":%d}",
-                             seq->valueint);
-                    pc_event_t ev;
-                    memset(&ev, 0, sizeof(ev));
-                    ev.event = "ping";
-                    ev.result = "ok";
-                    ev.code = DEMO_OK;
-                    ev.device_id = e.id.c_str();
-                    ev.data_json = data;
-                    pc_events_emit(&ev);
+                    std::lock_guard<std::mutex> sink_lock(sink_mu_);
+                    if (sink_)
+                        sink_->OnSerialBytes(e.id, e.session_id, frame.payload.data(),
+                                             frame.payload.size(), now_ms);
                 }
-                cJSON *pong = cJSON_CreateObject();
-                cJSON_AddStringToObject(pong, "cmd", CMD_PONG);
-                cJSON_AddNumberToObject(pong, "seq", seq->valueint); /* 回显序号 */
-                SendFrame(e.conn, pong);
-                cJSON_Delete(pong);
-                {
-                    char data[96];
-                    snprintf(data, sizeof(data), "{\"direction\":\"tx\",\"sequence\":%d}",
-                             seq->valueint);
-                    pc_event_t ev;
-                    memset(&ev, 0, sizeof(ev));
-                    ev.event = "pong";
-                    ev.result = "ok";
-                    ev.code = DEMO_OK;
-                    ev.device_id = e.id.c_str();
-                    ev.data_json = data;
-                    pc_events_emit(&ev);
+                continue;
+            }
+            cJSON *json = cJSON_ParseWithLength((const char *)frame.payload.data(),
+                                                frame.payload.size());
+            if (json == nullptr) {
+                LOG_W("HOST", "在线控制帧 JSON 解析失败");
+                continue;
+            }
+            const cJSON *cmd = cJSON_GetObjectItemCaseSensitive(json, "cmd");
+            const char *name = cmd && cJSON_IsString(cmd) ? cmd->valuestring : nullptr;
+            if (name && strcmp(name, CMD_PING) == 0) {
+                const cJSON *seq = cJSON_GetObjectItemCaseSensitive(json, "seq");
+                if (cJSON_IsNumber(seq)) {
+                    reg_.OnPing(e.id, (uint32_t)seq->valueint);
+                    {
+                        char data[96];
+                        snprintf(data, sizeof(data), "{\"direction\":\"rx\",\"sequence\":%d}",
+                                 seq->valueint);
+                        pc_event_t ev;
+                        memset(&ev, 0, sizeof(ev));
+                        ev.event = "ping";
+                        ev.result = "ok";
+                        ev.code = DEMO_OK;
+                        ev.device_id = e.id.c_str();
+                        ev.data_json = data;
+                        pc_events_emit(&ev);
+                    }
+                    cJSON *pong = cJSON_CreateObject();
+                    cJSON_AddStringToObject(pong, "cmd", CMD_PONG);
+                    cJSON_AddNumberToObject(pong, "seq", seq->valueint); /* 回显序号 */
+                    SendFrame(e.conn, pong);
+                    cJSON_Delete(pong);
+                    {
+                        char data[96];
+                        snprintf(data, sizeof(data), "{\"direction\":\"tx\",\"sequence\":%d}",
+                                 seq->valueint);
+                        pc_event_t ev;
+                        memset(&ev, 0, sizeof(ev));
+                        ev.event = "pong";
+                        ev.result = "ok";
+                        ev.code = DEMO_OK;
+                        ev.device_id = e.id.c_str();
+                        ev.data_json = data;
+                        pc_events_emit(&ev);
+                    }
                 }
+            } else if (name && strcmp(name, CMD_APP_DATA) == 0) {
+                const cJSON *data = cJSON_GetObjectItemCaseSensitive(json, "data");
+                const cJSON *text = data ? cJSON_GetObjectItemCaseSensitive(data, "text") : nullptr;
+                if (cJSON_IsString(text)) {
+                    LOG_I("HOST", "收到来自 %s 的调试消息：%s", e.id.c_str(), text->valuestring);
+                    emit_app_data_event("app_data_rx", e.id.c_str(), text->valuestring);
+                }
+            } else if (name) {
+                LOG_D("HOST", "在线连接收到未知命令：%s", name);
             }
-        } else if (name && strcmp(name, CMD_APP_DATA) == 0) {
-            const cJSON *data = cJSON_GetObjectItemCaseSensitive(json, "data");
-            const cJSON *text = data ? cJSON_GetObjectItemCaseSensitive(data, "text") : nullptr;
-            if (cJSON_IsString(text)) {
-                LOG_I("HOST", "收到来自 %s 的调试消息：%s", e.id.c_str(), text->valuestring);
-                emit_app_data_event("app_data_rx", e.id.c_str(), text->valuestring);
-            }
-        } else if (name) {
-            LOG_D("HOST", "在线连接收到未知命令：%s", name);
+            cJSON_Delete(json);
         }
-        cJSON_Delete(json);
     }
 }
 
