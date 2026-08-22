@@ -6,16 +6,19 @@
 #include <QMutex>
 #include <QObject>
 #include <QString>
+#include <QWaitCondition>
 
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <string>
+#include <thread>
 #include <vector>
 
 /* SERIAL_BYTES 数据面模型。
- * IHostDataSink 回调发生在 HostApp::Run 的 poll 线程：直接写落盘文件、按
- * serial_profile.frame_size 切帧并更新统计；Drain()/DisplayText() 由 GUI
- * 线程的 150ms 定时器调用，只搬运统计快照，不做文件 IO。 */
+ * IHostDataSink 回调发生在 HostApp::Run 的 poll 线程：仅复制到有界内存队列并
+ * 更新统计，绝不做磁盘 IO；独立 writer 线程负责落盘。Drain()/DisplayText()
+ * 由 GUI 线程的 150ms 定时器调用，只搬运统计快照。 */
 class SerialDataModel : public QObject, public IHostDataSink {
     Q_OBJECT
 public:
@@ -54,6 +57,16 @@ private:
         bool file_open = false;
     };
 
+    enum class WriteOpKind { Open, Data, Close };
+    struct WriteOp {
+        WriteOpKind kind = WriteOpKind::Data;
+        std::string path;
+        std::vector<uint8_t> bytes;
+    };
+
+    static constexpr size_t kWriteQueueCapacity = 4 * 1024 * 1024;
+
+    void WriterLoop();
     void CloseFileLocked();
     bool OpenFileLocked();
 
@@ -64,8 +77,13 @@ private:
     HostSerialProfile profile_;
     std::string device_id_;
     std::string session_id_;
-    FILE *file_ = nullptr;
+    bool file_open_ = false;
     std::string file_path_;
+    std::deque<WriteOp> write_queue_;
+    size_t queued_bytes_ = 0;
+    bool writer_stopping_ = false;
+    QWaitCondition writer_cv_;
+    std::thread writer_thread_;
     uint64_t total_bytes_ = 0;
     uint64_t frame_count_ = 0;        /* 按 profile_.frame_size 切帧计数 */
     uint64_t last_rx_ms_ = 0;         /* 协议传入的 receive_time_ms（单调时钟） */

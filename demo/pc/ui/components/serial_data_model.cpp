@@ -73,14 +73,20 @@ QString LastReceiveText(uint64_t wall_ms)
 } // namespace
 
 SerialDataModel::SerialDataModel(QObject *parent)
-    : QObject(parent)
+    : QObject(parent), writer_thread_(&SerialDataModel::WriterLoop, this)
 {
 }
 
 SerialDataModel::~SerialDataModel()
 {
-    QMutexLocker locker(&mu_);
-    CloseFileLocked();
+    {
+        QMutexLocker locker(&mu_);
+        CloseFileLocked();
+        writer_stopping_ = true;
+        writer_cv_.wakeAll();
+    }
+    if (writer_thread_.joinable())
+        writer_thread_.join();
 }
 
 void SerialDataModel::SetLogDirectory(const std::string &dir)
@@ -134,15 +140,17 @@ void SerialDataModel::OnSerialBytes(const std::string &device_id,
         return;
     }
 
-    if (file_ != nullptr) {
-        const size_t written = fwrite(bytes, 1, length, file_);
-        if (written != length) {
-            dropped_bytes_ += length - written;
-            LOG_W("SERIAL", "串口数据落盘写入不完整：期望 %zu 字节，实际 %zu 字节",
-                  length, written);
-        }
-    } else {
+    if (!file_open_ || length > kWriteQueueCapacity - queued_bytes_) {
         dropped_bytes_ += length;
+        if (file_open_)
+            LOG_W("SERIAL", "串口落盘队列已满，丢弃 %zu 字节（积压=%zu 字节）",
+                  length, queued_bytes_);
+    } else {
+        WriteOp op;
+        op.bytes.assign(bytes, bytes + length);
+        queued_bytes_ += length;
+        write_queue_.push_back(std::move(op));
+        writer_cv_.wakeOne();
     }
 
     /* 按 profile_.frame_size 切帧；不足一帧的残留与下一批数据拼接。 */
@@ -201,7 +209,7 @@ void SerialDataModel::Drain()
     display_.device_id = device_id_;
     display_.session_id = session_id_;
     display_.file_path = file_path_;
-    display_.file_open = file_ != nullptr;
+    display_.file_open = file_open_;
 }
 
 QString SerialDataModel::DisplayText() const
@@ -233,15 +241,77 @@ QString SerialDataModel::DisplayText() const
     return text;
 }
 
+void SerialDataModel::WriterLoop()
+{
+    FILE *file = nullptr;
+    std::string path;
+    for (;;) {
+        WriteOp op;
+        {
+            QMutexLocker locker(&mu_);
+            while (write_queue_.empty() && !writer_stopping_)
+                writer_cv_.wait(&mu_);
+            if (write_queue_.empty() && writer_stopping_)
+                break;
+            op = std::move(write_queue_.front());
+            write_queue_.pop_front();
+            queued_bytes_ -= op.bytes.size();
+        }
+
+        if (op.kind == WriteOpKind::Open) {
+            if (file != nullptr) {
+                fflush(file);
+                fclose(file);
+            }
+            path = op.path;
+#ifdef _WIN32
+            file = _wfopen(std::filesystem::path(path).c_str(), L"wb");
+#else
+            file = fopen(path.c_str(), "wb");
+#endif
+            if (file == nullptr) {
+                QMutexLocker locker(&mu_);
+                if (file_path_ == path)
+                    file_open_ = false;
+                LOG_W("SERIAL", "打开串口落盘文件失败：%s", path.c_str());
+            }
+            continue;
+        }
+        if (op.kind == WriteOpKind::Close) {
+            if (file != nullptr) {
+                if (fflush(file) != 0)
+                    LOG_W("SERIAL", "串口落盘文件 flush 失败：%s", path.c_str());
+                if (fclose(file) != 0)
+                    LOG_W("SERIAL", "串口落盘文件关闭失败：%s", path.c_str());
+                file = nullptr;
+            }
+            continue;
+        }
+        if (file == nullptr)
+            continue;
+        const size_t written = fwrite(op.bytes.data(), 1, op.bytes.size(), file);
+        if (written != op.bytes.size()) {
+            QMutexLocker locker(&mu_);
+            dropped_bytes_ += op.bytes.size() - written;
+            LOG_W("SERIAL", "串口数据落盘写入不完整：期望 %zu 字节，实际 %zu 字节",
+                  op.bytes.size(), written);
+        }
+    }
+    if (file != nullptr) {
+        fflush(file);
+        fclose(file);
+    }
+}
+
 void SerialDataModel::CloseFileLocked()
 {
-    if (file_ == nullptr)
+    if (!file_open_)
         return;
-    if (fflush(file_) != 0)
-        LOG_W("SERIAL", "串口落盘文件 flush 失败：%s", file_path_.c_str());
-    if (fclose(file_) != 0)
-        LOG_W("SERIAL", "串口落盘文件关闭失败：%s", file_path_.c_str());
-    file_ = nullptr;
+    WriteOp op;
+    op.kind = WriteOpKind::Close;
+    write_queue_.push_back(std::move(op));
+    file_open_ = false;
+    writer_cv_.wakeOne();
 }
 
 bool SerialDataModel::OpenFileLocked()
@@ -284,14 +354,11 @@ bool SerialDataModel::OpenFileLocked()
     }
 
     file_path_ = candidate.string();
-#ifdef _WIN32
-    file_ = _wfopen(candidate.c_str(), L"wb");
-#else
-    file_ = fopen(candidate.c_str(), "wb");
-#endif
-    if (file_ == nullptr) {
-        LOG_W("SERIAL", "打开串口落盘文件失败：%s", file_path_.c_str());
-        return false;
-    }
+    WriteOp op;
+    op.kind = WriteOpKind::Open;
+    op.path = file_path_;
+    write_queue_.push_back(std::move(op));
+    file_open_ = true;
+    writer_cv_.wakeOne();
     return true;
 }
