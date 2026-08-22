@@ -21,8 +21,10 @@ typedef struct device_app device_app_t;
 #define DEVICE_EVLOG_TEXT_MAX 95
 #define DEVICE_SCAN_MAX_APS 32
 
-/* wire v2 发送队列（runner 单线程，无锁）。 */
+/* wire v2 发送队列（runner 单线程，无锁）。为控制帧预留槽位，避免持续数据流
+ * 遇到短暂 TCP 背压时把 ping/pong 等控制面一起饿死。 */
 #define DEV_TX_QUEUE_CAP 64
+#define DEV_TX_CONTROL_RESERVE 4
 
 struct dev_tx_item {
     uint8_t *data;   /* malloc 编码后的完整帧（所有权归队列） */

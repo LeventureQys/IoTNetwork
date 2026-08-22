@@ -240,7 +240,10 @@ static int device_app_enqueue_frame(device_app_t *app, uint8_t frame_type,
 {
     if (app == NULL)
         return DEMO_ERR_INVAL;
-    if (app->tx_count >= DEV_TX_QUEUE_CAP)
+    int queue_limit = frame_type == PROTO_V2_TYPE_CONTROL_JSON
+        ? DEV_TX_QUEUE_CAP
+        : DEV_TX_QUEUE_CAP - DEV_TX_CONTROL_RESERVE;
+    if (app->tx_count >= queue_limit)
         return DEMO_ERR;
     int total = PROTO_V2_HEAD_LEN + PROTO_V2_BODY_HEAD_LEN + payload_len;
     uint8_t *frame = (uint8_t *)malloc((size_t)total);
