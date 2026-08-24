@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <string>
+#include <vector>
 #include "net_abstraction.h"
 #include "params.h"
 #include "host_registry.h"
@@ -22,7 +23,11 @@ public:
     void RequestStop();       /* 优雅退出：关闭 TCP → 停止热点 */
     void ForceCrash();        /* 剧本 host_crash：直接关闭，不广播 */
     /* UI 线程调用：向指定设备入队一条联调消息（app_data），由主循环冲刷发送 */
-    int SendAppDataToDevice(const std::string &id, const std::string &text);
+    int SendAppDataToDevice(const std::string &id, const std::string &text); /* app_data */
+    /* UI 线程调用：向指定设备入队一帧已编码的串口消息（SERIAL_BYTES）。 */
+    int SendSerialFrameToDevice(const std::string &id,
+                                const std::vector<uint8_t> &frame);
+
     /* 数据面 sink 透传：HostTcpServer 内部已有空指针保护与回调线程同步 */
     void SetDataSink(IHostDataSink *sink) { tcp_server_.SetDataSink(sink); }
     size_t OnlineCount() const;

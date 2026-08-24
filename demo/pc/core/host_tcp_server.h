@@ -37,6 +37,10 @@ public:
     /* UI 线程调用：入队一条联调消息，由 Poll 在 host 线程冲刷发送。
      * 返回 DEMO_OK=已入队；DEMO_ERR=id/text 为空或 text 超 APP_DATA_TEXT_MAX */
     int QueueAppData(const std::string &device_id, const std::string &text);
+    /* UI 线程调用：入队一帧已编码的串口消息（SERIAL_BYTES），由 Poll 冲刷发送。
+     * 返回 DEMO_OK=已入队；DEMO_ERR=id 为空或 frame 为空/超长 */
+    int QueueSerialFrame(const std::string &device_id,
+                         const std::vector<uint8_t> &frame);
 
 private:
     struct PendingConn {
@@ -49,14 +53,21 @@ private:
 
     struct SendCtx {
         std::deque<std::vector<uint8_t>> queue;
+
         std::vector<uint8_t> inflight;
         size_t inflight_off = 0;
         uint64_t tx_sequence = 0;
     };
 
+    struct PendingSerialFrame {
+        std::string device_id;
+        std::vector<uint8_t> frame;
+    };
+
     void HandlePending(PendingConn &pc, uint64_t now_ms);
     void HandleOnline(DeviceEntry &e, uint64_t now_ms);
     void FlushPendingTx();
+    void FlushPendingSerialTx();
     void FlushTx();
     int SendFrame(void *sock, cJSON *obj);
     int SendSerialBytes(void *sock, const uint8_t *bytes, size_t length);
@@ -75,6 +86,7 @@ private:
     std::map<void *, SendCtx> send_ctx_;             /* 发送队列（按句柄隔离） */
     std::mutex tx_mu_;
     std::vector<std::pair<std::string, std::string>> pending_tx_; /* (device_id, text) */
+    std::vector<PendingSerialFrame> pending_serial_frames_; /* (device_id, frame) */
     uint32_t app_data_seq_ = 0;
 };
 

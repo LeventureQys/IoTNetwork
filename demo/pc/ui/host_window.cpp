@@ -3,6 +3,7 @@
 #include "log_model.h"
 #include "handshake_flow_widget.h"
 #include "serial_data_model.h"
+#include "serial_text_frame.h"
 #include "log.h"
 
 #include <QCloseEvent>
@@ -92,6 +93,19 @@ HostWindow::HostWindow(HostApp *host, QWidget *parent)
     msg_send_button_ = new QPushButton(QStringLiteral("发送消息"), this);
     connect(msg_send_button_, &QPushButton::clicked, this, &HostWindow::SendAppData);
 
+    serial_edit_ = new QLineEdit(this);
+    serial_edit_->setPlaceholderText(
+        QStringLiteral("输入单帧串口文本（UTF-8，≤512 字节），按 AA 55 01 规则编码"));
+    serial_send_button_ = new QPushButton(QStringLiteral("发送串口单帧"), this);
+    connect(serial_send_button_, &QPushButton::clicked, this,
+            &HostWindow::SendSerialFrame);
+
+    QHBoxLayout *serial_buttons = new QHBoxLayout;
+    serial_buttons->addWidget(new QLabel(QStringLiteral("串口单帧："), this));
+    serial_buttons->addWidget(serial_edit_, 1);
+    serial_buttons->addWidget(serial_send_button_);
+    serial_buttons->addStretch();
+
     QHBoxLayout *buttons = new QHBoxLayout;
     buttons->addWidget(stop_button);
     buttons->addWidget(msg_edit_, 1);
@@ -101,6 +115,7 @@ HostWindow::HostWindow(HostApp *host, QWidget *parent)
     layout->addWidget(hotspot_status_);
     layout->addWidget(summary_);
     layout->addWidget(serial_stats_);
+    layout->addLayout(serial_buttons);
     layout->addWidget(flow_widget_);
     layout->addWidget(splitter, 1);
     layout->addLayout(buttons);
@@ -189,6 +204,40 @@ void HostWindow::SendAppData()
         LOG_I("MAIN", "上位机界面：联调消息已提交发送（目标=%s）", online->id.c_str());
     else
         LOG_W("MAIN", "发送失败：消息为空或超过 %d 字节", APP_DATA_TEXT_MAX);
+}
+
+void HostWindow::SendSerialFrame()
+{
+    const auto entries = host_->registry().Snapshot();
+    const DeviceEntry *online = nullptr;
+    for (const auto &entry : entries) {
+        if (entry.state == "online") {
+            online = &entry;
+            break;
+        }
+    }
+    if (!online) {
+        LOG_W("MAIN", "当前无在线设备，无法发送串口单帧");
+        return;
+    }
+
+    const QByteArray utf8 = serial_edit_->text().toUtf8();
+    const std::string text(utf8.constData(), static_cast<size_t>(utf8.size()));
+    std::vector<uint8_t> frame;
+    if (!serial_text_frame::Encode(text, &frame)) {
+        LOG_W("MAIN", "串口单帧编码失败：文本为空或超过 %zu 字节",
+              static_cast<size_t>(serial_text_frame::kMaxPayloadBytes));
+        return;
+    }
+
+    const int rc = host_->SendSerialFrameToDevice(online->id, frame);
+    if (rc == DEMO_OK) {
+        LOG_I("MAIN", "串口单帧已编码并提交发送（目标=%s，%zu 字节）",
+              online->id.c_str(), frame.size());
+        serial_edit_->clear();
+    } else {
+        LOG_W("MAIN", "串口单帧提交失败（rc=%d）", rc);
+    }
 }
 
 void HostWindow::closeEvent(QCloseEvent *event)

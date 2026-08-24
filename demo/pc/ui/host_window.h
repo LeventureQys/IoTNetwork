@@ -32,6 +32,7 @@ protected:
 private slots:
     void Refresh();
     void SendAppData();
+    void SendSerialFrame();
 
 private:
     HostApp *host_;
@@ -44,6 +45,8 @@ private:
     QLabel *serial_stats_;
     QTableWidget *device_table_;
     QLineEdit *msg_edit_;
+    QLineEdit *serial_edit_;
+    QPushButton *serial_send_button_;
     QPushButton *msg_send_button_;
     bool stopping_ = false;
 };

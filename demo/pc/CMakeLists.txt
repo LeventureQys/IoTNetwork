@@ -102,6 +102,7 @@ add_library(pc_core STATIC
     core/host_registry.cpp
     core/host_tcp_server.cpp
     core/host_app.cpp
+    core/serial_text_frame.cpp
 )
 target_include_directories(pc_core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include/pc"

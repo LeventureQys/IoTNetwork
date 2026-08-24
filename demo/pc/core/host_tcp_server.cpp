@@ -1,4 +1,5 @@
 #include "host_tcp_server.h"
+#include "serial_text_frame.h"
 #include "cJSON.h"
 #include "frame.h"
 #include "protocol.h"
@@ -361,6 +362,8 @@ void HostTcpServer::Poll(uint64_t now_ms)
 
     /* 冲刷 UI 入队的联调消息（app_data） */
     FlushPendingTx();
+    /* 冲刷 UI 入队的单帧串口消息（SERIAL_BYTES） */
+    FlushPendingSerialTx();
     /* 冲刷发送队列（控制 + 数据，处理 partial write / EAGAIN） */
     FlushTx();
 }
@@ -372,6 +375,52 @@ int HostTcpServer::QueueAppData(const std::string &device_id, const std::string 
     std::lock_guard<std::mutex> lock(tx_mu_);
     pending_tx_.emplace_back(device_id, text);
     return DEMO_OK;
+}
+
+int HostTcpServer::QueueSerialFrame(const std::string &device_id,
+                                    const std::vector<uint8_t> &frame)
+{
+    if (device_id.empty() || frame.empty() ||
+        frame.size() > PROTO_V2_SERIAL_CHUNK_MAX)
+        return DEMO_ERR;
+    std::lock_guard<std::mutex> lock(tx_mu_);
+    pending_serial_frames_.push_back({device_id, frame});
+    return DEMO_OK;
+}
+
+void HostTcpServer::FlushPendingSerialTx()
+{
+    std::vector<PendingSerialFrame> queue;
+    {
+        std::lock_guard<std::mutex> lock(tx_mu_);
+        queue.swap(pending_serial_frames_);
+    }
+    for (const auto &item : queue) {
+        DeviceEntry *e = reg_.Find(item.device_id);
+        if (!e || e->state != "online" || !e->conn) {
+            LOG_W("HOST", "串口单帧丢弃：%s 不在线", item.device_id.c_str());
+            continue;
+        }
+
+        LOG_I("HOST", "[串口TX] 单帧串口消息（%zu 字节）：%s",
+              item.frame.size(),
+              serial_text_frame::Hex(item.frame.data(), item.frame.size()).c_str());
+
+        std::string unpacked;
+        if (serial_text_frame::Decode(item.frame.data(), item.frame.size(),
+                                      &unpacked)) {
+            LOG_I("HOST", "[串口TX] 解包出来的串口消息（%zu 字节）：%s",
+                  unpacked.size(), unpacked.c_str());
+        } else {
+            LOG_W("HOST", "[串口TX] 该帧无法按文本帧规则解包，仍按原始字节下发");
+        }
+
+        const int rc = SendSerialBytes(e->conn, item.frame.data(),
+                                       item.frame.size());
+        if (rc != DEMO_OK)
+            LOG_W("HOST", "串口单帧发送失败：%s（rc=%d）",
+                  item.device_id.c_str(), rc);
+    }
 }
 
 void HostTcpServer::FlushPendingTx()
@@ -590,6 +639,17 @@ void HostTcpServer::HandleOnline(DeviceEntry &e, uint64_t now_ms)
             }
             reg_.OnRx(e.id, now_ms);
             if (frame.type == PROTO_V2_TYPE_SERIAL_BYTES) {
+
+                std::string unpacked;
+                if (serial_text_frame::Decode(frame.payload.data(),
+                                              frame.payload.size(), &unpacked)) {
+                    LOG_I("HOST", "[串口RX] 单帧串口消息（%zu 字节）：%s",
+                          frame.payload.size(),
+                          serial_text_frame::Hex(frame.payload.data(),
+                                                 frame.payload.size()).c_str());
+                    LOG_I("HOST", "[串口RX] 解包出来的串口消息（%zu 字节）：%s",
+                          unpacked.size(), unpacked.c_str());
+                }
                 {
                     std::lock_guard<std::mutex> sink_lock(sink_mu_);
                     if (sink_)

@@ -170,6 +170,12 @@ int HostApp::SendAppDataToDevice(const std::string &id, const std::string &text)
     return tcp_server_.QueueAppData(id, text);
 }
 
+int HostApp::SendSerialFrameToDevice(const std::string &id,
+                                     const std::vector<uint8_t> &frame)
+{
+    return tcp_server_.QueueSerialFrame(id, frame);
+}
+
 size_t HostApp::OnlineCount() const
 {
     HostRegistry &r = const_cast<HostRegistry &>(registry_);
